@@ -1,0 +1,269 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Themes
+ *
+ * Components use `gray` for neutrals and `blue` as the accent, so each theme
+ * re-skins the app by overriding those Tailwind color variables. The `dark`
+ * class picks the light/dark variant of whichever theme is active. The
+ * neutral scales are deliberately tinted well past Tailwind's defaults so
+ * the themes stay distinguishable in both light and dark variants.
+ */
+
+/* Gray: truly neutral (no blue cast), stock blue accent */
+[data-theme='gray'] {
+  --color-gray-50: #fafafa;
+  --color-gray-100: #f5f5f5;
+  --color-gray-200: #e5e5e5;
+  --color-gray-300: #d4d4d4;
+  --color-gray-400: #a3a3a3;
+  --color-gray-500: #737373;
+  --color-gray-600: #525252;
+  --color-gray-700: #404040;
+  --color-gray-800: #262626;
+  --color-gray-900: #171717;
+  --color-gray-950: #0a0a0a;
+}
+
+/* Ocean: saturated blue-gray neutrals, cyan accent */
+[data-theme='ocean'] {
+  --color-white: #f8fbfe;
+  --color-gray-50: #f0f6fc;
+  --color-gray-100: #e1ecf7;
+  --color-gray-200: #c9dcee;
+  --color-gray-300: #a5c2dd;
+  --color-gray-400: #7195b8;
+  --color-gray-500: #4d7093;
+  --color-gray-600: #395774;
+  --color-gray-700: #2c455e;
+  --color-gray-800: #1b3048;
+  --color-gray-900: #102238;
+  --color-gray-950: #081527;
+  --color-blue-50: #ecfeff;
+  --color-blue-100: #cffafe;
+  --color-blue-200: #a5f3fc;
+  --color-blue-300: #67e8f9;
+  --color-blue-400: #22d3ee;
+  --color-blue-500: #06b6d4;
+  --color-blue-600: #0891b2;
+  --color-blue-700: #0e7490;
+  --color-blue-800: #155e75;
+  --color-blue-900: #164e63;
+  --color-blue-950: #083344;
+}
+
+/* Forest: green-tinted neutrals, emerald accent */
+[data-theme='forest'] {
+  --color-white: #f9fcf9;
+  --color-gray-50: #eff6ef;
+  --color-gray-100: #e0eee0;
+  --color-gray-200: #c8dfc8;
+  --color-gray-300: #a3c6a3;
+  --color-gray-400: #74a074;
+  --color-gray-500: #527a52;
+  --color-gray-600: #406140;
+  --color-gray-700: #334e33;
+  --color-gray-800: #1f351f;
+  --color-gray-900: #142514;
+  --color-gray-950: #0a160a;
+  --color-blue-50: #ecfdf5;
+  --color-blue-100: #d1fae5;
+  --color-blue-200: #a7f3d0;
+  --color-blue-300: #6ee7b7;
+  --color-blue-400: #34d399;
+  --color-blue-500: #10b981;
+  --color-blue-600: #059669;
+  --color-blue-700: #047857;
+  --color-blue-800: #065f46;
+  --color-blue-900: #064e3b;
+  --color-blue-950: #022c22;
+}
+
+/* Sunset: warm sand neutrals, orange accent */
+[data-theme='sunset'] {
+  --color-white: #fefbf6;
+  --color-gray-50: #faf5ef;
+  --color-gray-100: #f5ecdf;
+  --color-gray-200: #ead9c3;
+  --color-gray-300: #d9bd9d;
+  --color-gray-400: #b8946b;
+  --color-gray-500: #91714c;
+  --color-gray-600: #74583a;
+  --color-gray-700: #5d462e;
+  --color-gray-800: #402f1e;
+  --color-gray-900: #2d2013;
+  --color-gray-950: #1a1109;
+  --color-blue-50: #fff7ed;
+  --color-blue-100: #ffedd5;
+  --color-blue-200: #fed7aa;
+  --color-blue-300: #fdba74;
+  --color-blue-400: #fb923c;
+  --color-blue-500: #f97316;
+  --color-blue-600: #ea580c;
+  --color-blue-700: #c2410c;
+  --color-blue-800: #9a3412;
+  --color-blue-900: #7c2d12;
+  --color-blue-950: #431407;
+}
+
+/* Orchid: purple-tinted neutrals, violet accent */
+[data-theme='orchid'] {
+  --color-white: #fcfafe;
+  --color-gray-50: #f7f3fa;
+  --color-gray-100: #efe7f5;
+  --color-gray-200: #e0d1eb;
+  --color-gray-300: #c8aeda;
+  --color-gray-400: #a683bd;
+  --color-gray-500: #82609b;
+  --color-gray-600: #684a7e;
+  --color-gray-700: #533a66;
+  --color-gray-800: #392747;
+  --color-gray-900: #281a33;
+  --color-gray-950: #160d1e;
+  --color-blue-50: #f5f3ff;
+  --color-blue-100: #ede9fe;
+  --color-blue-200: #ddd6fe;
+  --color-blue-300: #c4b5fd;
+  --color-blue-400: #a78bfa;
+  --color-blue-500: #8b5cf6;
+  --color-blue-600: #7c3aed;
+  --color-blue-700: #6d28d9;
+  --color-blue-800: #5b21b6;
+  --color-blue-900: #4c1d95;
+  --color-blue-950: #2e1065;
+}
+
+/*
+ * Chart palette
+ *
+ * The eight categorical slots are assigned to series in this fixed order and
+ * never cycled — a ninth group is folded away by the backend's top-N cut, not
+ * given an invented hue. The hues are identity, so they do not follow the
+ * theme; only the chrome (grid, axis) does. The dark column is the same eight
+ * hues stepped for the dark surface. Both sets are validated for colorblind
+ * separation against the surfaces they render on (white / gray-800).
+ */
+:root {
+  --chart-1: #2a78d6;
+  --chart-2: #1baf7a;
+  --chart-3: #eda100;
+  --chart-4: #008300;
+  --chart-5: #4a3aa7;
+  --chart-6: #e34948;
+  --chart-7: #e87ba4;
+  --chart-8: #eb6834;
+  --chart-surface: #ffffff;
+  --chart-grid: var(--color-gray-200);
+  --chart-axis: var(--color-gray-300);
+  --chart-ink: var(--color-gray-500);
+}
+
+.dark {
+  --chart-1: #3987e5;
+  --chart-2: #199e70;
+  --chart-3: #c98500;
+  --chart-4: #008300;
+  --chart-5: #9085e9;
+  --chart-6: #e66767;
+  --chart-7: #d55181;
+  --chart-8: #d95926;
+  --chart-surface: var(--color-gray-800);
+  --chart-grid: var(--color-gray-700);
+  --chart-axis: var(--color-gray-600);
+  --chart-ink: var(--color-gray-400);
+}
+
+/*
+ * Match highlights
+ *
+ * Hits are tinted by the capture group that matched them, on the same slots as
+ * the chart palette, so a criterion keeps one colour from the query builder
+ * through the highlighted results to its chart series. `hl-match` is the plain
+ * highlight for queries without groups. The underline carries the identity;
+ * the translucent fill stays light enough to keep the text readable on both
+ * surfaces.
+ */
+/* Like the chart hues, the highlight yellows are identity and do not follow
+   the theme; they are the stock yellow-200/700 the viewer always used. */
+.hl-match {
+  border-radius: 2px;
+  background-color: #fef08a;
+  color: #1f2937;
+}
+
+.dark .hl-match {
+  background-color: color-mix(in srgb, #a16207 60%, transparent);
+  color: #fef9c3;
+}
+
+.hl-1, .hl-2, .hl-3, .hl-4, .hl-5, .hl-6, .hl-7, .hl-8 {
+  border-radius: 2px;
+  background-color: color-mix(in srgb, var(--hl) 20%, transparent);
+  box-shadow: inset 0 -2px 0 var(--hl);
+}
+
+.hl-1 { --hl: var(--chart-1); }
+.hl-2 { --hl: var(--chart-2); }
+.hl-3 { --hl: var(--chart-3); }
+.hl-4 { --hl: var(--chart-4); }
+.hl-5 { --hl: var(--chart-5); }
+.hl-6 { --hl: var(--chart-6); }
+.hl-7 { --hl: var(--chart-7); }
+.hl-8 { --hl: var(--chart-8); }
+
+/*
+ * Scrollbars
+ *
+ * The colors are defined as inheritable variables on :root/.dark so the
+ * document scrollbar (on <html> itself) is styled too, and they follow the
+ * active theme through the gray scale.
+ */
+:root {
+  /* Drives native/overlay scrollbars and form controls that ::-webkit-scrollbar
+     rules don't reach; without it WebView2 falls back to a light OS scrollbar. */
+  color-scheme: light;
+  --scrollbar-thumb: var(--color-gray-300);
+  --scrollbar-thumb-hover: var(--color-gray-400);
+  --scrollbar-track: var(--color-gray-50);
+}
+
+.dark {
+  color-scheme: dark;
+  --scrollbar-thumb: var(--color-gray-600);
+  --scrollbar-thumb-hover: var(--color-gray-500);
+  --scrollbar-track: var(--color-gray-900);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+/* Inner containers show their own background through the track; the window
+   scrollbar has nothing behind it and would default to white, so it gets the
+   page background explicitly. */
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+html::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
