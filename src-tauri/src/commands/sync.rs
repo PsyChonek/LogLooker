@@ -1,11 +1,101 @@
-use crate::auth::{self, TokenState};
+use crate::auth::TokenState;
 use crate::cache::{self, CacheStatus, SyncSummary};
-use crate::config::ConfigState;
-use crate::kudu::KuduClient;
+use crate::config::{ConfigState, ServiceConfig};
+use crate::locations;
 use crate::logger::LogState;
-use crate::profiles;
+use crate::plugin::PluginState;
 use chrono::NaiveDate;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::Emitter;
+
+/// Set by `cancel_sync`, read by a running sync per download chunk, between
+/// files, and between services in the batch - a large file stops mid-stream and
+/// its partial is kept as a resumable prefix. `sync_services` and
+/// `download_services` rearm it at the start of each run. Shared by both since
+/// the UI runs them one at a time.
+pub struct SyncCancel(pub Arc<AtomicBool>);
+
+impl SyncCancel {
+    pub fn new() -> Self {
+        SyncCancel(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+#[tauri::command]
+pub fn cancel_sync(cancel: tauri::State<'_, SyncCancel>) {
+    cancel.0.store(true, Ordering::Relaxed);
+}
+
+/// Syncs one service's logs into the local cache: resolves the pack that owns
+/// it, builds its transport, ensures a log location (detecting and persisting one
+/// if absent), and downloads the missing/changed files for the range while
+/// emitting "sync-progress" (throttled) and "cache-status" events. Shared by
+/// `sync_services` and `download_services`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sync_one(
+    app: &tauri::AppHandle,
+    config_state: &tauri::State<'_, ConfigState>,
+    plugin_state: &tauri::State<'_, PluginState>,
+    token_state: &tauri::State<'_, TokenState>,
+    service: &ServiceConfig,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+    cancel: &AtomicBool,
+) -> Result<SyncSummary, String> {
+    let id = &service.id;
+    let registry = plugin_state.snapshot();
+    let pack = registry.pack(&service.pack_id).cloned().ok_or_else(|| {
+        format!(
+            "{id}: its plugin \"{}\" is not loaded - enable or reinstall it in Plugins",
+            service.pack_id
+        )
+    })?;
+    let source = super::services::source_for(&pack, service, token_state).await?;
+
+    let location_id = match &service.location {
+        Some(id) => id.clone(),
+        None => {
+            let detected = locations::detect(&source, &pack)
+                .await?
+                .ok_or_else(|| {
+                    format!(
+                        "{id}: none of {}'s log locations matched - set one in the services table",
+                        pack.manifest.name
+                    )
+                })?;
+            let mut guard = config_state.0.lock().map_err(|e| e.to_string())?;
+            if let Some(entry) = guard.services.iter_mut().find(|s| &s.id == id) {
+                entry.location = Some(detected.clone());
+            }
+            crate::config::save_config(&guard)?;
+            detected
+        }
+    };
+    let location = pack.location(&location_id).ok_or_else(|| {
+        format!(
+            "{id}: {} has no log location \"{location_id}\" - pick another in the services table",
+            pack.manifest.name
+        )
+    })?;
+
+    let mut last_emitted: u64 = 0;
+    cache::sync_service(&source, service, location, date_from, date_to, cancel, |p| {
+        let boundary = p.bytes_downloaded / 524_288;
+        if p.state != "downloading" || boundary > last_emitted {
+            last_emitted = boundary;
+            app.emit("sync-progress", &p).ok();
+        }
+        // The manifest is saved before "done"/"skipped" is reported, so the
+        // status is already up to date for this file
+        if p.state != "downloading" {
+            if let Ok(status) = cache::cache_status(service) {
+                app.emit("cache-status", &status).ok();
+            }
+        }
+    })
+    .await
+}
 
 /// Syncs the selected services' logs for a date range into the local cache.
 /// Emits "sync-progress" events (cache::SyncProgress payload), throttled so
@@ -13,11 +103,14 @@ use tauri::Emitter;
 /// (cache::CacheStatus payload) after each finished file so the cached size
 /// and coverage columns update while the sync is still running.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_services(
     app: tauri::AppHandle,
     config_state: tauri::State<'_, ConfigState>,
+    plugin_state: tauri::State<'_, PluginState>,
     token_state: tauri::State<'_, TokenState>,
     log_state: tauri::State<'_, LogState>,
+    cancel: tauri::State<'_, SyncCancel>,
     service_ids: Vec<String>,
     date_from: NaiveDate,
     date_to: NaiveDate,
@@ -27,66 +120,52 @@ pub async fn sync_services(
         guard.services.clone()
     };
 
-    let token = auth::get_token(&token_state).await?;
+    let cancel = Arc::clone(&cancel.0);
+    cancel.store(false, Ordering::Relaxed);
     let mut summaries = Vec::new();
 
     for id in &service_ids {
-        // Each service is synced independently: one that fails (missing Kudu URL,
-        // undetectable profile, download error) is skipped and reported rather
-        // than aborting the whole batch, so the remaining services still sync.
-        let result: Result<cache::SyncSummary, String> = async {
-            let service = services
-                .iter()
-                .find(|s| &s.id == id)
-                .ok_or_else(|| format!("Unknown service: {id}"))?;
-            let kudu_url = service
-                .kudu_url
-                .as_deref()
-                .ok_or_else(|| format!("{id}: Kudu URL not set — set it in the services table"))?;
-            let client = KuduClient::new(kudu_url, token.clone())?;
-
-            let profile = match service.profile {
-                Some(profile) => profile,
-                None => {
-                    let detected = profiles::detect(&client)
-                        .await?
-                        .ok_or_else(|| format!("{id}: no known log location found"))?;
-                    let mut guard = config_state.0.lock().map_err(|e| e.to_string())?;
-                    if let Some(entry) = guard.services.iter_mut().find(|s| &s.id == id) {
-                        entry.profile = Some(detected);
-                    }
-                    crate::config::save_config(&guard)?;
-                    detected
-                }
-            };
-
-            let mut last_emitted: u64 = 0;
-            cache::sync_service(&client, service, profile, date_from, date_to, |p| {
-                let boundary = p.bytes_downloaded / 524_288;
-                if p.state != "downloading" || boundary > last_emitted {
-                    last_emitted = boundary;
-                    app.emit("sync-progress", &p).ok();
-                }
-                // The manifest is saved before "done"/"skipped" is reported, so the
-                // status is already up to date for this file
-                if p.state != "downloading" {
-                    if let Ok(status) = cache::cache_status(service) {
-                        app.emit("cache-status", &status).ok();
-                    }
-                }
-            })
-            .await
+        // The user cancelled: stop before starting the next service. Whatever
+        // already synced stays cached and is reported in the summaries so far.
+        if cancel.load(Ordering::Relaxed) {
+            log_state.info("sync", "cancelled by user");
+            break;
         }
-        .await;
+        // Each service is synced independently: one that fails (missing endpoint,
+        // undetectable location, download error) is skipped and reported rather
+        // than aborting the whole batch, so the remaining services still sync.
+        let result: Result<cache::SyncSummary, String> = match services.iter().find(|s| &s.id == id)
+        {
+            Some(service) => {
+                sync_one(
+                    &app,
+                    &config_state,
+                    &plugin_state,
+                    &token_state,
+                    service,
+                    date_from,
+                    date_to,
+                    &cancel,
+                )
+                .await
+            }
+            None => Err(format!("Unknown service: {id}")),
+        };
 
         match result {
             Ok(summary) => {
+                let failed = if summary.files_failed > 0 {
+                    format!(", {} failed", summary.files_failed)
+                } else {
+                    String::new()
+                };
                 log_state.info(
                     "sync",
                     &format!(
-                        "{id}: {} downloaded, {} skipped, {:.1} MB",
+                        "{id}: {} downloaded, {} skipped{failed} of {}, {:.1} MB",
                         summary.files_downloaded,
                         summary.files_skipped,
+                        summary.files_total,
                         summary.bytes_downloaded as f64 / 1_048_576.0
                     ),
                 );
@@ -96,12 +175,13 @@ pub async fn sync_services(
                 summaries.push(summary);
             }
             Err(e) => {
-                log_state.error("sync", &format!("{id}: sync failed — {e}"));
+                log_state.error("sync", &format!("{id}: sync failed - {e}"));
                 summaries.push(SyncSummary {
                     service_id: id.clone(),
                     files_total: 0,
                     files_downloaded: 0,
                     files_skipped: 0,
+                    files_failed: 0,
                     bytes_downloaded: 0,
                     warnings: vec![format!("sync failed: {e}")],
                 });

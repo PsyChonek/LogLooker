@@ -5,22 +5,104 @@ export interface LogEntry {
   message: string;
 }
 
-export type Environment = 'test' | 'production';
+// An environment id as some loaded plugin declares it, e.g. 'test'
+export type Environment = string;
 
-export type ProfileKind = 'core-applogs' | 'framework-app-data' | 'docker-logfiles';
+export interface EnvironmentDef {
+  id: string;
+  label: string;
+}
 
-// 'scraped' services are owned by the status page refresh and cannot be removed
+// 'scraped' services are owned by their plugin's discovery and cannot be removed
 export type ServiceSource = 'scraped' | 'builtin' | 'manual';
 
 export interface ServiceConfig {
   id: string;
   name: string;
   environment: Environment;
-  kuduUrl: string | null;
-  // True once the user hand-edited the Kudu URL, so a refresh keeps their value
-  kuduUrlManual: boolean;
-  profile: ProfileKind | null;
+  // The plugin that owns this service's transport and log locations
+  packId: string;
+  // Kudu base URL, folder path - whatever the plugin's source takes
+  endpoint: string | null;
+  // True once the user hand-edited the endpoint, so a refresh keeps their value
+  endpointManual: boolean;
+  // Id of the plugin log location to read; null until detection ran
+  location: string | null;
   source: ServiceSource;
+}
+
+// --- Plugins (src-tauri/src/plugin.rs) ---
+
+export type FieldType = 'guid' | 'string' | 'number';
+
+// One extracted field, addressed as '<packId>.<key>'
+export interface FieldInfo {
+  key: string;
+  label: string;
+  packId: string;
+  type: FieldType;
+}
+
+export interface LocationInfo {
+  id: string;
+  label: string;
+  dir: string;
+  // False for undated growing files, which are filtered by line timestamps
+  dated: boolean;
+}
+
+export interface PresetDef {
+  name: string;
+  query: string;
+  isRegex: boolean;
+}
+
+export interface ChartPresetDef {
+  name: string;
+  mode: ChartMode;
+  bucket: ChartBucket;
+  // 'none' | 'service' | 'file' | 'matchedGroup' | 'custom' | 'field:<key>'
+  groupBy: string;
+  customRegex: string | null;
+  metric: ChartMetric;
+  // 'field:<key>' | 'custom'
+  value: string | null;
+  topN: number | null;
+}
+
+export type PackOrigin = 'bundled' | { user: { path: string } };
+
+export interface PackInfo {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  origin: PackOrigin;
+  // A user pack of this id replaced the bundled one
+  overridesBundled: boolean;
+  environments: EnvironmentDef[];
+  sourceType: 'kudu' | 'local-folder';
+  discoveryType: 'none' | 'static' | 'scrape';
+  // Button text for a discovery refresh; null when the plugin cannot discover
+  discoveryLabel: string | null;
+  locations: LocationInfo[];
+  fields: FieldInfo[];
+  presets: PresetDef[];
+  charts: ChartPresetDef[];
+}
+
+// A plugin that would not load, so the UI can say which file and why
+export interface PackError {
+  source: string;
+  message: string;
+}
+
+export interface PluginsInfo {
+  packs: PackInfo[];
+  errors: PackError[];
+  disabled: string[];
+  pluginsDir: string;
+  bundled: string[];
 }
 
 export interface SavedQuery {
@@ -31,11 +113,22 @@ export interface SavedQuery {
 
 export interface AppConfig {
   services: ServiceConfig[];
+  // Environments the user created, on top of what the plugins declare
+  environments: EnvironmentDef[];
   savedQueries: SavedQuery[];
   // Built-in ids already seeded once; must round-trip through update_config,
   // otherwise a deleted built-in comes back on the next start
   seededBuiltins: string[];
+  // Plugins the user switched off; a disabled plugin is not loaded at all
+  disabledPacks: string[];
   memoryCache: MemoryCacheConfig;
+  search: SearchConfig;
+}
+
+export interface SearchConfig {
+  // A search stops collecting past this many hits and reports the result as
+  // truncated. Hits are stored compactly, roughly 100 bytes each.
+  maxHits: number;
 }
 
 export interface MemoryCacheConfig {
@@ -60,7 +153,7 @@ export interface SyncProgress {
   fileCount: number;
   bytesDownloaded: number;
   totalBytes: number;
-  state: 'downloading' | 'done' | 'skipped';
+  state: 'downloading' | 'processing' | 'done' | 'skipped' | 'failed';
 }
 
 export interface SyncSummary {
@@ -68,7 +161,23 @@ export interface SyncSummary {
   filesTotal: number;
   filesDownloaded: number;
   filesSkipped: number;
+  // Files whose download failed; each has a matching entry in warnings
+  filesFailed: number;
   bytesDownloaded: number;
+  warnings: string[];
+}
+
+// Result of downloading one service to a chosen folder: the sync counts plus
+// how many cached files were decompressed into the folder
+export interface DownloadSummary {
+  serviceId: string;
+  filesDownloaded: number;
+  filesSkipped: number;
+  filesFailed: number;
+  bytesDownloaded: number;
+  filesExported: number;
+  bytesExported: number;
+  targetDir: string;
   warnings: string[];
 }
 
@@ -81,6 +190,14 @@ export interface CacheStatus {
   newest: string | null;
   // Minutes the service's log clock runs ahead of UTC; null while it cannot be told
   logOffsetMinutes: number | null;
+  // Whole days with nothing cached inside the oldest-newest span, bounded by
+  // the exact cached timestamps on either side
+  gaps: CoverageGap[];
+}
+
+export interface CoverageGap {
+  from: string;
+  to: string;
 }
 
 export interface SearchRequest {
@@ -93,12 +210,10 @@ export interface SearchRequest {
   contextLines: number;
 }
 
-export interface ExtractedFields {
-  idLogin: string | null;
-  idCommand: string | null;
-  operation: string | null;
-  durationMs: number | null;
-}
+// A hit's extracted values, keyed by the column key ('<packId>.<field>') the
+// plugin declared. Only values actually found are present; SearchMeta.fields
+// says what the columns are and how to label them.
+export type ExtractedFields = Record<string, string>;
 
 export interface SearchHit {
   serviceId: string;
@@ -131,15 +246,42 @@ export interface SearchMeta {
   durationMs: number;
   // Named capture groups of the query, in pattern order
   groupNames: string[];
+  // The columns this result carries, in order. Which fields exist depends on the
+  // loaded plugins, so the table takes its extra columns from here.
+  fields: FieldInfo[];
+  // The configured hit cap cut the result short
+  truncated: boolean;
+}
+
+// Export or copy the current result, one line per hit. With extract, only the
+// matched part (first capture group) of each line; path writes a file (all
+// matches), otherwise the capped text comes back for the clipboard.
+export interface ExportRequest {
+  query: string;
+  isRegex: boolean;
+  caseSensitive: boolean;
+  extract: boolean;
+  path: string | null;
+  maxLines: number | null;
+  // Named groups toggled off in the legend; left out of the extracted output
+  excludeGroups: string[];
+}
+
+export interface ExportResult {
+  text: string | null;
+  savedPath: string | null;
+  exported: number;
+  total: number;
+  truncated: boolean;
 }
 
 // --- Charts (aggregation of the last search, see src-tauri/src/chart.rs) ---
 
 export type ChartMode = 'timeline' | 'category';
-export type ChartGroupBy =
-  'none' | 'service' | 'operation' | 'idLogin' | 'file' | 'custom' | 'matchedGroup';
+// 'field' groups by one of the loaded plugins' fields, named in groupField
+export type ChartGroupBy = 'none' | 'service' | 'file' | 'custom' | 'matchedGroup' | 'field';
 export type ChartMetric = 'count' | 'sum' | 'avg' | 'min' | 'max' | 'p50' | 'p95' | 'p99';
-export type ChartValueSource = 'duration' | 'custom';
+export type ChartValueSource = 'field' | 'custom';
 export type ChartBucket =
   'auto' | 'second' | 'minute' | 'fiveMinutes' | 'fifteenMinutes' | 'hour' | 'sixHours' | 'day';
 
@@ -152,12 +294,16 @@ export interface ChartRequest {
   customRegex: string | null;
   metric: ChartMetric;
   valueSource: ChartValueSource;
+  // Column key required by groupBy 'field'
+  groupField: string | null;
+  // Column key required by valueSource 'field'
+  valueField: string | null;
   topN: number;
 }
 
 export interface ChartSeries {
   name: string;
-  // null is a bucket with no data — a gap in a line, no bar in a bar chart
+  // null is a bucket with no data - a gap in a line, no bar in a bar chart
   values: (number | null)[];
 }
 

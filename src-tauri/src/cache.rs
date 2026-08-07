@@ -1,23 +1,31 @@
 use crate::config::ServiceConfig;
-use crate::kudu::KuduClient;
-use crate::profiles::{self, ProfileKind, RemoteLogFile};
-use crate::scraper::Environment;
+use crate::locations::{self, RemoteLogFile};
+use crate::plugin::CompiledLocation;
+use crate::source::LogSource;
 use crate::search::parse_timestamp;
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Cached files are stored zstd-compressed. Growing remote files are synced
 /// incrementally: only bytes past the last known size are fetched (HTTP Range)
-/// and appended as a new zstd frame — decoders handle concatenated frames.
+/// and appended as a new zstd frame - decoders handle concatenated frames.
 /// Files that can still grow (dated today, or undated like Log.txt) are never
-/// skipped on listing equality alone — the listing may lag behind writes — so
+/// skipped on listing equality alone - the listing may lag behind writes - so
 /// they are probed with a ranged request past the cached size on every sync.
+/// A single growing remote file (FrameworkAppData's Log.txt) does not go
+/// through the per-file path at all - see the `growing` module.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub entries: HashMap<String, CachedFile>,
+    /// Sync state of single growing remote files (Log.txt), keyed by VFS path.
+    /// Their lines live as per-day segment `entries`; this remembers how much
+    /// of the remote file was already consumed into them.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub growing: HashMap<String, crate::growing::GrowingState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +38,7 @@ pub struct CachedFile {
     pub instance: Option<String>,
     /// Real span of the log lines inside the file. The filename only dates the
     /// per-day files; Log.txt is one growing file whose span is content-only.
-    /// Absent in manifests written before this was recorded — backfilled on sync.
+    /// Absent in manifests written before this was recorded - backfilled on sync.
     #[serde(default)]
     pub first_ts: Option<NaiveDateTime>,
     #[serde(default)]
@@ -104,6 +112,9 @@ pub struct SyncSummary {
     pub files_total: usize,
     pub files_downloaded: usize,
     pub files_skipped: usize,
+    /// Files whose download failed; each has a matching entry in `warnings`.
+    /// They stay out of the manifest so the next sync retries them.
+    pub files_failed: usize,
     pub bytes_downloaded: u64,
     pub warnings: Vec<String>,
 }
@@ -120,17 +131,13 @@ pub fn cache_root() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Path only — does not touch the filesystem. Reads (status, search) must not
+/// Path only - does not touch the filesystem. Reads (status, search) must not
 /// create directories as a side effect.
-pub fn service_dir_path(environment: Environment, name: &str) -> Result<PathBuf, String> {
-    let env = match environment {
-        Environment::Test => "test",
-        Environment::Production => "production",
-    };
-    Ok(cache_root()?.join(env).join(name))
+pub fn service_dir_path(environment: &str, name: &str) -> Result<PathBuf, String> {
+    Ok(cache_root()?.join(environment).join(name))
 }
 
-pub fn service_dir(environment: Environment, name: &str) -> Result<PathBuf, String> {
+pub fn service_dir(environment: &str, name: &str) -> Result<PathBuf, String> {
     let dir = service_dir_path(environment, name)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create cache dir: {e}"))?;
     Ok(dir)
@@ -143,31 +150,44 @@ pub fn load_manifest(dir: &std::path::Path) -> Manifest {
     }
 }
 
-fn save_manifest(dir: &std::path::Path, manifest: &Manifest) -> Result<(), String> {
+pub(crate) fn save_manifest(dir: &std::path::Path, manifest: &Manifest) -> Result<(), String> {
     let text = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("manifest.json"), text)
         .map_err(|e| format!("Cannot write manifest: {e}"))
 }
 
 /// Syncs one service's logs for a date range into the local cache.
-/// `on_progress` is called with download progress for the UI.
+/// `on_progress` is called with download progress for the UI. `cancel` is polled
+/// before each file so a running sync stops promptly when the user cancels;
+/// files already stored stay cached and are reflected in the returned summary.
 pub async fn sync_service(
-    client: &KuduClient,
+    source: &LogSource,
     service: &ServiceConfig,
-    profile: ProfileKind,
+    location: &CompiledLocation,
     from: NaiveDate,
     to: NaiveDate,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(SyncProgress),
 ) -> Result<SyncSummary, String> {
-    let dir = service_dir(service.environment, &service.name)?;
+    let dir = service_dir(&service.environment, &service.name)?;
     let mut manifest = load_manifest(&dir);
-    let files = profiles::list_files(client, profile, from, to).await?;
+    let files = locations::list_files(source, location, from, to).await?;
+
+    // An undated growing file is not mirrored one-to-one: its lines are split
+    // into per-day segments that survive the remote file's rotation
+    if !location.dated {
+        return crate::growing::sync_growing(
+            source, &dir, service, &mut manifest, files, cancel, on_progress,
+        )
+        .await;
+    }
 
     let mut summary = SyncSummary {
         service_id: service.id.clone(),
         files_total: files.len(),
         files_downloaded: 0,
         files_skipped: 0,
+        files_failed: 0,
         bytes_downloaded: 0,
         warnings: Vec::new(),
     };
@@ -178,7 +198,7 @@ pub async fn sync_service(
         .collect();
     if instances.len() > 1 {
         summary.warnings.push(format!(
-            "Service ran on {} instances in this range; Kudu only exposes files present on disk — verify coverage",
+            "Service ran on {} instances in this range; Kudu only exposes files present on disk - verify coverage",
             instances.len()
         ));
     }
@@ -186,6 +206,11 @@ pub async fn sync_service(
     let today = chrono::Local::now().date_naive();
     let file_count = files.len();
     for (index, file) in files.into_iter().enumerate() {
+        // Stop before starting another file; the manifest is saved after each
+        // completed one, so what was already downloaded is safely cached.
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let unchanged = manifest.entries.get(&file.vfs_path).is_some_and(|entry| {
             entry.remote_size == file.size && entry.remote_mtime == file.mtime
         });
@@ -206,7 +231,7 @@ pub async fn sync_service(
 
         let cached = manifest.entries.get(&file.vfs_path);
         // For an unchanged live file the sizes are equal and the ranged probe
-        // starts at the end — zero new bytes confirms the cache is current.
+        // starts at the end - zero new bytes confirms the cache is current.
         let known_size = cached
             .map(|entry| entry.remote_size)
             .filter(|&size| size < file.size || unchanged);
@@ -215,31 +240,49 @@ pub async fn sync_service(
             last: entry.last_ts,
         });
 
-        let stored = match download_and_compress(
-            client,
-            &dir,
-            &file,
-            known_size,
-            |downloaded| {
-                on_progress(SyncProgress {
-                    service_id: service.id.clone(),
-                    file_name: file.name.clone(),
-                    file_index: index + 1,
-                    file_count,
-                    bytes_downloaded: downloaded,
-                    total_bytes: file.size,
-                    state: "downloading".into(),
-                });
-            },
-        )
-        .await
-        {
+        // A failing file gets one more full attempt before it counts as failed -
+        // on top of the per-request retries inside download_file, this restarts
+        // the transfer from scratch, which also clears a poisoned partial state.
+        let mut result: Result<StoredFile, String> = Err(String::new());
+        for attempt in 0..2 {
+            if attempt > 0 {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            result = download_and_compress(
+                source,
+                &dir,
+                &file,
+                known_size,
+                cancel,
+                |downloaded, state| {
+                    on_progress(SyncProgress {
+                        service_id: service.id.clone(),
+                        file_name: file.name.clone(),
+                        file_index: index + 1,
+                        file_count,
+                        bytes_downloaded: downloaded,
+                        // Downloads are capped at the listed size, so this never exceeds it
+                        total_bytes: file.size.max(downloaded),
+                        state: state.into(),
+                    });
+                },
+            )
+            .await;
+            if result.is_ok() {
+                break;
+            }
+        }
+        let stored = match result {
             Ok(stored) => stored,
             // A single file failing to download must not abort the rest of the
-            // sync — record it and move on. Leaving it out of the manifest means
+            // sync - record it and move on. Leaving it out of the manifest means
             // the next sync retries it.
             Err(e) => {
-                summary.warnings.push(format!("{}: download failed — {e}", file.name));
+                summary.files_failed += 1;
+                summary.warnings.push(format!("{}: download failed - {e}", file.name));
                 on_progress(SyncProgress {
                     service_id: service.id.clone(),
                     file_name: file.name.clone(),
@@ -247,13 +290,13 @@ pub async fn sync_service(
                     file_count,
                     bytes_downloaded: 0,
                     total_bytes: file.size,
-                    state: "skipped".into(),
+                    state: "failed".into(),
                 });
                 continue;
             }
         };
 
-        // A probe that found nothing past the cached size — the file is current
+        // A probe that found nothing past the cached size - the file is current
         if stored.appended && stored.bytes == 0 {
             backfill_time_range(&dir, &mut manifest, &file.vfs_path)?;
             summary.files_skipped += 1;
@@ -277,7 +320,7 @@ pub async fn sync_service(
         };
 
         // The file may have grown between listing and download, so record what
-        // was actually stored — the next ranged sync must start past it
+        // was actually stored - the next ranged sync must start past it
         let cached_size = if stored.appended {
             known_size.unwrap_or(0) + stored.bytes
         } else {
@@ -299,6 +342,12 @@ pub async fn sync_service(
         save_manifest(&dir, &manifest)?;
         summary.files_downloaded += 1;
         summary.bytes_downloaded += stored.bytes;
+        if stored.truncated {
+            summary.warnings.push(format!(
+                "{}: transfer interrupted - kept {} of {} bytes, the rest resumes on the next sync",
+                file.name, cached_size, file.size
+            ));
+        }
         on_progress(SyncProgress {
             service_id: service.id.clone(),
             file_name: file.name.clone(),
@@ -313,7 +362,7 @@ pub async fn sync_service(
     Ok(summary)
 }
 
-/// A file whose content can still grow: dated today (or later), or undated —
+/// A file whose content can still grow: dated today (or later), or undated -
 /// a growing file like Log.txt. Live files are always probed for new content.
 fn is_live(file: &RemoteLogFile, today: NaiveDate) -> bool {
     file.date.map_or(true, |date| date >= today)
@@ -344,36 +393,47 @@ fn backfill_time_range(
 
 struct StoredFile {
     bytes: u64,
-    /// Span of the downloaded chunk — the whole file, or just the new tail
+    /// Span of the downloaded chunk - the whole file, or just the new tail
     range: TimeRange,
     appended: bool,
+    /// The transfer was cut short and salvaged: what is stored is a valid prefix,
+    /// and the next ranged sync resumes past it.
+    truncated: bool,
 }
 
 /// Downloads (fully, or from `range_from` for grown files) and stores the file
 /// as zstd. A ranged download appends a new frame; a full one replaces the file.
 async fn download_and_compress(
-    client: &KuduClient,
+    source: &LogSource,
     dir: &std::path::Path,
     file: &RemoteLogFile,
     range_from: Option<u64>,
-    on_chunk: impl FnMut(u64),
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(u64, &str),
 ) -> Result<StoredFile, String> {
     let temp_path = dir.join(format!("{}.download", file.name));
     let final_path = dir.join(format!("{}.zst", file.name));
 
-    let result = client
-        .download_file(&file.vfs_path, &temp_path, range_from, on_chunk)
+    let result = source
+        .download_file(&file.vfs_path, &temp_path, range_from, Some(file.size), cancel, |d| {
+            on_progress(d, "downloading")
+        })
         .await?;
 
-    // A ranged probe answered with no bytes — nothing new past the cached size
+    // A ranged probe answered with no bytes - nothing new past the cached size
     if result.was_partial && result.bytes_written == 0 {
         std::fs::remove_file(&temp_path).ok();
         return Ok(StoredFile {
             bytes: 0,
             range: TimeRange::default(),
             appended: true,
+            truncated: false,
         });
     }
+
+    // Scanning and compressing a large file takes a while - tell the UI the
+    // download itself is finished so it does not look stuck at 100%
+    on_progress(result.bytes_written, "processing");
 
     let append = range_from.is_some() && result.was_partial && final_path.exists();
     let raw = std::fs::File::open(&temp_path).map_err(|e| e.to_string())?;
@@ -396,7 +456,103 @@ async fn download_and_compress(
         bytes: result.bytes_written,
         range,
         appended: append,
+        truncated: result.truncated,
     })
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    pub files_written: usize,
+    pub bytes_written: u64,
+    /// The per-service folder the files were written to
+    pub target_dir: String,
+    pub warnings: Vec<String>,
+}
+
+/// Decompresses the service's cached files that fall in `[from, to]` into
+/// `target_root/<env>/<name>/`, one plain-text file per cached file (the `.zst`
+/// suffix dropped). Undated growing files (Log.txt) are always included, since
+/// they cannot be sliced by day. The per-service subfolder is created only once
+/// there is something to write into it.
+pub fn export_service(
+    service: &ServiceConfig,
+    from: NaiveDate,
+    to: NaiveDate,
+    target_root: &std::path::Path,
+) -> Result<ExportSummary, String> {
+    let dir = service_dir_path(&service.environment, &service.name)?;
+    let manifest = load_manifest(&dir);
+    let out_dir = target_root
+        .join(&service.environment)
+        .join(&service.name);
+    let mut summary = ExportSummary {
+        target_dir: out_dir.display().to_string(),
+        ..Default::default()
+    };
+
+    for entry in manifest.entries.values() {
+        // Dated files outside the range are skipped; undated ones always export
+        if let Some(date) = entry.date {
+            if date < from || date > to {
+                continue;
+            }
+        }
+        // The name ultimately derives from a remote Kudu listing; refuse any that
+        // carries a path separator or `..` so a decompressed file can never land
+        // outside the service's export folder.
+        let name = entry.local_name.trim_end_matches(".zst");
+        if std::path::Path::new(name)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            summary.warnings.push(format!("Skipped unsafe file name: {name}"));
+            continue;
+        }
+        let source = dir.join(&entry.local_name);
+        if !source.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(&out_dir)
+            .map_err(|e| format!("Cannot create {}: {e}", out_dir.display()))?;
+        let target = out_dir.join(name);
+        if let Err(e) = decompress_to(&source, &target) {
+            summary.warnings.push(e);
+            continue;
+        }
+        summary.files_written += 1;
+        summary.bytes_written += std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+    }
+    Ok(summary)
+}
+
+/// Decompresses one cached file (`<file>.zst`) to a path the user chose. Returns
+/// the number of bytes written. Used by the "Export" actions in the Files view
+/// and the raw viewer, which both name a file by service and base name.
+pub fn export_cached_file(
+    service: &ServiceConfig,
+    file: &str,
+    target: &std::path::Path,
+) -> Result<u64, String> {
+    let dir = service_dir_path(&service.environment, &service.name)?;
+    let source = dir.join(format!("{file}.zst"));
+    if !source.exists() {
+        return Err(format!("{file} is not cached for {}", service.name));
+    }
+    decompress_to(&source, target)?;
+    Ok(std::fs::metadata(target).map(|m| m.len()).unwrap_or(0))
+}
+
+/// Decompresses one zstd cache file to a plain-text file. Cache files may hold
+/// several concatenated zstd frames (incremental appends) - the decoder reads
+/// them all.
+fn decompress_to(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    let raw = std::fs::File::open(source)
+        .map_err(|e| format!("Cannot open {}: {e}", source.display()))?;
+    let output = std::fs::File::create(target)
+        .map_err(|e| format!("Cannot create {}: {e}", target.display()))?;
+    zstd::stream::copy_decode(std::io::BufReader::new(raw), output)
+        .map_err(|e| format!("zstd decompression failed for {}: {e}", source.display()))
 }
 
 /// `oldest`/`newest` span the log lines actually cached, not the file names, so
@@ -412,6 +568,67 @@ pub struct CacheStatus {
     pub newest: Option<NaiveDateTime>,
     /// Minutes the log clock runs ahead of UTC; `None` while it cannot be told
     pub log_offset_minutes: Option<i32>,
+    /// Holes inside the oldest-newest span - see `coverage_gaps`
+    pub gaps: Vec<CoverageGap>,
+}
+
+/// A span with nothing cached: from the last cached line before the hole to the
+/// first cached line after it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageGap {
+    pub from: NaiveDateTime,
+    pub to: NaiveDateTime,
+}
+
+/// Whole days with nothing cached, strictly between the first and last covered
+/// day. Each gap carries the exact cached timestamps on either side, so the UI
+/// can say precisely what span is missing. Days are the unit on purpose: the
+/// slack between one day's last line and the next day's first (a quiet night)
+/// is not a gap.
+fn coverage_gaps(manifest: &Manifest) -> Vec<CoverageGap> {
+    let day_start = |day: NaiveDate| day.and_hms_opt(0, 0, 0).expect("midnight is valid");
+    let day_end = |day: NaiveDate| day.and_hms_opt(23, 59, 59).expect("valid time");
+
+    // Day -> first and last cached moment on it. Entries without timestamps
+    // fall back to the whole day their filename dates; entries with neither
+    // cannot place any coverage and are skipped.
+    let mut days: std::collections::BTreeMap<NaiveDate, (NaiveDateTime, NaiveDateTime)> =
+        std::collections::BTreeMap::new();
+    for entry in manifest.entries.values() {
+        let first = entry.first_ts.or_else(|| entry.date.map(day_start));
+        let last = entry.last_ts.or_else(|| entry.date.map(day_end));
+        let (Some(first), Some(last)) = (first, last) else {
+            continue;
+        };
+        let mut day = first.date();
+        while day <= last.date() {
+            let covered = (first.max(day_start(day)), last.min(day_end(day)));
+            days.entry(day)
+                .and_modify(|(f, l)| {
+                    *f = (*f).min(covered.0);
+                    *l = (*l).max(covered.1);
+                })
+                .or_insert(covered);
+            let Some(next) = day.succ_opt() else { break };
+            day = next;
+        }
+    }
+
+    let mut gaps = Vec::new();
+    let mut previous: Option<(NaiveDate, NaiveDateTime)> = None;
+    for (&day, &(first, last)) in &days {
+        if let Some((previous_day, previous_last)) = previous {
+            if day.signed_duration_since(previous_day).num_days() > 1 {
+                gaps.push(CoverageGap {
+                    from: previous_last,
+                    to: first,
+                });
+            }
+        }
+        previous = Some((day, last));
+    }
+    gaps
 }
 
 /// No real time zone is further from UTC than this, so a wider delta is evidence
@@ -420,20 +637,38 @@ const MAX_OFFSET_MINUTES: i64 = 14 * 60;
 
 /// Minutes the service's log clock runs ahead of UTC, or `None` if no cached file
 /// can say. A log line carries no zone, and an App Service with `WEBSITE_TIME_ZONE`
-/// set writes wall-clock local time while a default one writes UTC — the same line
+/// set writes wall-clock local time while a default one writes UTC - the same line
 /// either way. Kudu dates every file in UTC, and a log file's last write *is* its
 /// last timestamped line, so `last_ts - mtime` measures the clock the lines are in.
 /// This holds for files of any age, unlike comparing the newest line against "now",
 /// which only says anything while a service is actively logging.
 ///
 /// Reduced by median because a manifest's mtime comes from the listing that preceded
-/// the download and can lag content appended after it — such a file reads hours ahead
+/// the download and can lag content appended after it - such a file reads hours ahead
 /// on its own, but cannot move the middle of the set.
+///
+/// Day segments of a growing file break the "last write is the last line" rule: a
+/// closed segment keeps the source file's mtime from the sync that last appended to
+/// it, hours after that day's final line, and recent ones pass the sanity filter
+/// with deltas that read as a fictional zone. Only the newest segment of each
+/// growing file - the one the last sync actually ended on - measures the clock.
 pub fn detect_offset_minutes(manifest: &Manifest) -> Option<i32> {
+    let mut newest_segment: HashMap<&str, NaiveDate> = HashMap::new();
+    for key in manifest.entries.keys() {
+        if let Some((path, day)) = crate::growing::split_segment_key(key) {
+            let newest = newest_segment.entry(path).or_insert(day);
+            *newest = (*newest).max(day);
+        }
+    }
     let mut deltas: Vec<i64> = manifest
         .entries
-        .values()
-        .filter_map(|entry| {
+        .iter()
+        .filter_map(|(key, entry)| {
+            if let Some((path, day)) = crate::growing::split_segment_key(key) {
+                if newest_segment.get(path) != Some(&day) {
+                    return None;
+                }
+            }
             let last = entry.last_ts?;
             let mtime = chrono::DateTime::parse_from_rfc3339(&entry.remote_mtime).ok()?;
             Some((last - mtime.naive_utc()).num_minutes())
@@ -453,7 +688,7 @@ pub fn detect_offset_minutes(manifest: &Manifest) -> Option<i32> {
 /// The service's log clock offset, read from its sync manifest. Absent for a service
 /// with nothing cached, or one whose files were all cached before time ranges were.
 pub fn service_offset_minutes(service: &ServiceConfig) -> Option<i32> {
-    let dir = service_dir_path(service.environment, &service.name).ok()?;
+    let dir = service_dir_path(&service.environment, &service.name).ok()?;
     detect_offset_minutes(&load_manifest(&dir))
 }
 
@@ -461,7 +696,7 @@ pub fn service_offset_minutes(service: &ServiceConfig) -> Option<i32> {
 #[serde(rename_all = "camelCase")]
 pub struct CachedFileInfo {
     pub service_id: String,
-    /// Name as the search hits report it — the cache file without the .zst suffix
+    /// Name as the search hits report it - the cache file without the .zst suffix
     pub file: String,
     pub date: Option<NaiveDate>,
     pub size_bytes: u64,
@@ -471,7 +706,7 @@ pub struct CachedFileInfo {
 
 /// The service's cached files, newest first. Undated files (growing Log.txt) sort last.
 pub fn cached_files(service: &ServiceConfig) -> Result<Vec<CachedFileInfo>, String> {
-    let dir = service_dir_path(service.environment, &service.name)?;
+    let dir = service_dir_path(&service.environment, &service.name)?;
     let manifest = load_manifest(&dir);
     let mut files: Vec<CachedFileInfo> = manifest
         .entries
@@ -500,7 +735,7 @@ pub fn cached_files(service: &ServiceConfig) -> Result<Vec<CachedFileInfo>, Stri
 /// Removes one cached file and its manifest entry. The next sync of a date
 /// range covering it simply downloads it again.
 pub fn delete_cached_file(service: &ServiceConfig, file: &str) -> Result<(), String> {
-    let dir = service_dir_path(service.environment, &service.name)?;
+    let dir = service_dir_path(&service.environment, &service.name)?;
     let mut manifest = load_manifest(&dir);
     let local_name = format!("{file}.zst");
     let key = manifest
@@ -516,11 +751,19 @@ pub fn delete_cached_file(service: &ServiceConfig, file: &str) -> Result<(), Str
         }
     }
     manifest.entries.remove(&key);
+    // Deleting the last day segment of a growing file also forgets its sync
+    // state, so a later sync re-downloads whatever the server still has
+    let entries = &manifest.entries;
+    manifest.growing.retain(|vfs_path, _| {
+        entries
+            .keys()
+            .any(|k| k.strip_prefix(vfs_path.as_str()).is_some_and(|rest| rest.starts_with('@')))
+    });
     save_manifest(&dir, &manifest)
 }
 
 pub fn cache_status(service: &ServiceConfig) -> Result<CacheStatus, String> {
-    let dir = service_dir_path(service.environment, &service.name)?;
+    let dir = service_dir_path(&service.environment, &service.name)?;
     let manifest = load_manifest(&dir);
     let mut status = CacheStatus {
         service_id: service.id.clone(),
@@ -530,6 +773,7 @@ pub fn cache_status(service: &ServiceConfig) -> Result<CacheStatus, String> {
         oldest: None,
         newest: None,
         log_offset_minutes: detect_offset_minutes(&manifest),
+        gaps: coverage_gaps(&manifest),
     };
     for entry in manifest.entries.values() {
         status.uncompressed_bytes += entry.remote_size;
@@ -615,7 +859,7 @@ mod tests {
     }
 
     /// One manifest entry: a file whose Kudu mtime is `mtime` and whose last log
-    /// line reads `last_ts` — the pair the offset is measured from.
+    /// line reads `last_ts` - the pair the offset is measured from.
     fn cached(name: &str, mtime: &str, last_ts: Option<&str>) -> (String, CachedFile) {
         let parse = |ts: &str| NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f").unwrap();
         (
@@ -635,6 +879,7 @@ mod tests {
     fn manifest_of(files: Vec<(String, CachedFile)>) -> Manifest {
         Manifest {
             entries: files.into_iter().collect(),
+            ..Default::default()
         }
     }
 
@@ -665,6 +910,86 @@ mod tests {
             cached("a", "2026-07-14T01:12:09Z", Some("2026-07-14T11:35:27")),
             cached("b", "2026-07-13T23:59:37Z", Some("2026-07-13T23:59:37")),
             cached("c", "2026-07-12T23:59:52Z", Some("2026-07-12T23:59:52")),
+        ]);
+        assert_eq!(detect_offset_minutes(&manifest), Some(0));
+    }
+
+    /// One manifest entry spanning `first..last`, dated when the name is - the
+    /// shape coverage_gaps reads.
+    fn spanning(name: &str, date: Option<&str>, first: Option<&str>, last: Option<&str>) -> (String, CachedFile) {
+        let parse_ts = |ts: &str| NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S").unwrap();
+        (
+            name.to_string(),
+            CachedFile {
+                remote_size: 10,
+                remote_mtime: "2026-07-14T10:00:00Z".to_string(),
+                local_name: format!("{name}.zst"),
+                date: date.map(|d| d.parse().unwrap()),
+                instance: None,
+                first_ts: first.map(parse_ts),
+                last_ts: last.map(parse_ts),
+            },
+        )
+    }
+
+    #[test]
+    fn a_missing_day_is_a_gap_bounded_by_the_cached_lines_around_it() {
+        let manifest = manifest_of(vec![
+            spanning("a", None, Some("2026-07-15T06:00:01"), Some("2026-07-15T21:14:09")),
+            spanning("b", None, Some("2026-07-17T05:30:12"), Some("2026-07-17T22:00:00")),
+        ]);
+        assert_eq!(
+            coverage_gaps(&manifest),
+            vec![CoverageGap {
+                from: "2026-07-15T21:14:09".parse().unwrap(),
+                to: "2026-07-17T05:30:12".parse().unwrap(),
+            }]
+        );
+    }
+
+    #[test]
+    fn consecutive_days_have_no_gap_despite_the_quiet_night_between_them() {
+        let manifest = manifest_of(vec![
+            spanning("a", None, Some("2026-07-15T06:00:01"), Some("2026-07-15T21:14:09")),
+            spanning("b", None, Some("2026-07-16T05:30:12"), Some("2026-07-16T22:00:00")),
+        ]);
+        assert_eq!(coverage_gaps(&manifest), vec![]);
+    }
+
+    #[test]
+    fn an_entry_spanning_several_days_bridges_them() {
+        let manifest = manifest_of(vec![
+            spanning("a", None, Some("2026-07-13T09:00:00"), Some("2026-07-16T04:00:00")),
+            spanning("b", None, Some("2026-07-16T05:30:12"), Some("2026-07-16T22:00:00")),
+        ]);
+        assert_eq!(coverage_gaps(&manifest), vec![]);
+    }
+
+    #[test]
+    fn a_dated_entry_without_timestamps_counts_as_its_whole_day() {
+        // Cached before time ranges were recorded - the filename still dates it
+        let manifest = manifest_of(vec![
+            spanning("a", Some("2026-07-13"), None, None),
+            spanning("b", None, Some("2026-07-15T05:30:12"), Some("2026-07-15T22:00:00")),
+        ]);
+        assert_eq!(
+            coverage_gaps(&manifest),
+            vec![CoverageGap {
+                from: "2026-07-13T23:59:59".parse().unwrap(),
+                to: "2026-07-15T05:30:12".parse().unwrap(),
+            }]
+        );
+    }
+
+    #[test]
+    fn closed_day_segments_of_a_growing_file_do_not_skew_the_offset() {
+        // Seen in the wild: closed segments keep the mtime of the sync that last
+        // appended to them, hours after their own last line. Read together they
+        // said the log clock ran on UTC-6:30; only the newest segment may count.
+        let manifest = manifest_of(vec![
+            cached("app/Log.txt@2026-07-19", "2026-07-20T07:44:35Z", Some("2026-07-19T23:55:01")),
+            cached("app/Log.txt@2026-07-20", "2026-07-21T06:25:01Z", Some("2026-07-20T23:55:01")),
+            cached("app/Log.txt@2026-07-21", "2026-07-21T08:22:32Z", Some("2026-07-21T08:22:32")),
         ]);
         assert_eq!(detect_offset_minutes(&manifest), Some(0));
     }
