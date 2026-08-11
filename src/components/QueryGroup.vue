@@ -27,6 +27,36 @@ const inactive = computed(() => props.muted === true || props.group.disabled ===
 
 const slot = computed(() => ctx.groupSlotOf(props.group));
 
+// Folded out of the way: the header stays, with a count of what it hides, and
+// the rows come back untouched when it opens again. The root never folds -
+// there would be nothing left to look at.
+const collapsed = computed(() => props.parent !== undefined && props.group.collapsed === true);
+
+function toggleCollapsed() {
+  props.group.collapsed = !props.group.collapsed;
+}
+
+const visibleChildren = computed<QueryNode[]>(() => (collapsed.value ? [] : props.group.children));
+
+const summary = computed(() => {
+  let criteria = 0;
+  let groups = 0;
+  const walk = (group: GroupNode) => {
+    for (const child of group.children) {
+      if (child.type === 'group') {
+        groups += 1;
+        walk(child);
+      } else {
+        criteria += 1;
+      }
+    }
+  };
+  walk(props.group);
+  const parts = [`${criteria} ${criteria === 1 ? 'criterion' : 'criteria'}`];
+  if (groups > 0) parts.push(`${groups} ${groups === 1 ? 'group' : 'groups'}`);
+  return parts.join(', ');
+});
+
 function emptyCriterion(): CriterionNode {
   return { type: 'criterion', mode: 'contains', text: '', label: '' };
 }
@@ -97,8 +127,12 @@ function overChild(index: number, event: DragEvent) {
 function overSelf(event: DragEvent) {
   const parent = props.parent;
   if (!parent) return;
-  if (sideOf(event) === 1) ctx.hoverDrop(props.group, 0);
-  else ctx.hoverDrop(parent, parent.children.indexOf(props.group));
+  const index = parent.children.indexOf(props.group);
+  // A collapsed group shows no rows to aim between, so its header takes the
+  // slot above or below the group itself instead of reaching inside it
+  if (collapsed.value) ctx.hoverDrop(parent, index + sideOf(event));
+  else if (sideOf(event) === 1) ctx.hoverDrop(props.group, 0);
+  else ctx.hoverDrop(parent, index);
 }
 
 // The button row under the last child appends to this group - the way a node
@@ -123,6 +157,8 @@ const FIELD =
   'px-2 py-1 font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800';
 const BUTTON =
   'px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50';
+const ICON_BUTTON =
+  'shrink-0 p-0.5 rounded text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-200';
 const GRIP =
   'shrink-0 cursor-grab active:cursor-grabbing text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400';
 // Where the dragged node would land, drawn in the gap between two rows
@@ -142,8 +178,31 @@ const DROP_LINE = 'h-0.5 -mt-1 mb-1 rounded-full bg-blue-500 dark:bg-blue-400';
     ]"
     :style="depth > 0 && slot !== null ? { borderLeftColor: `var(--chart-${slot})` } : {}"
   >
-    <div class="flex items-center gap-2 mb-1.5" @dragover="overSelf">
+    <div class="flex items-center gap-2" :class="collapsed ? '' : 'mb-1.5'" @dragover="overSelf">
       <template v-if="parent">
+        <button
+          type="button"
+          :class="ICON_BUTTON"
+          :aria-expanded="!collapsed"
+          :title="collapsed ? 'Expand this group' : 'Collapse this group'"
+          @click="toggleCollapsed"
+        >
+          <svg
+            class="size-3 block"
+            :class="collapsed ? '-rotate-90' : ''"
+            viewBox="0 0 12 12"
+            aria-hidden="true"
+          >
+            <path
+              d="M2.5 4.5 6 8l3.5-3.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
         <!-- Dragging the header moves the whole group, subgroups included -->
         <span
           :class="GRIP"
@@ -195,10 +254,12 @@ const DROP_LINE = 'h-0.5 -mt-1 mb-1 rounded-full bg-blue-500 dark:bg-blue-400';
         :disabled="inactive"
         @keydown.enter="ctx.search()"
       />
+      <!-- What the fold hides, so a collapsed group still says how big it is -->
+      <span v-if="collapsed" class="text-gray-400 dark:text-gray-500">{{ summary }}</span>
       <button v-if="parent" :class="BUTTON" @click="removeSelf">Remove group</button>
     </div>
 
-    <template v-for="(child, i) in group.children" :key="ctx.keyOf(child)">
+    <template v-for="(child, i) in visibleChildren" :key="ctx.keyOf(child)">
       <div v-if="ctx.dropAt(group, i)" :class="DROP_LINE" />
       <QueryGroup
         v-if="child.type === 'group'"
@@ -292,11 +353,11 @@ const DROP_LINE = 'h-0.5 -mt-1 mb-1 rounded-full bg-blue-500 dark:bg-blue-400';
       </div>
     </template>
 
-    <div v-if="ctx.dropAt(group, group.children.length)" :class="DROP_LINE" />
+    <div v-if="!collapsed && ctx.dropAt(group, group.children.length)" :class="DROP_LINE" />
 
     <!-- Also the drop zone that appends to this group, which is how a row gets
          into a group it is not already hovering a child of -->
-    <div class="flex items-center gap-2" @dragover="overEnd">
+    <div v-if="!collapsed" class="flex items-center gap-2" @dragover="overEnd">
       <button :class="BUTTON" :disabled="inactive" @click="addCriterion">Add criterion</button>
       <button :class="BUTTON" :disabled="inactive" @click="addGroup">Add group</button>
     </div>

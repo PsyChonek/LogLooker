@@ -71,6 +71,7 @@ function sanitizeNode(raw: unknown): QueryNode | null {
       children,
       label: typeof node.label === 'string' ? node.label : '',
       disabled: node.disabled === true,
+      collapsed: node.collapsed === true,
     };
   }
   return sanitizeCriterion(node);
@@ -270,7 +271,8 @@ onMounted(() => {
     <div class="mb-2 text-gray-400">
       Groups nest with AND/OR, e.g. (A or B) and (C and D); "not" criteria always exclude the whole
       entry - stack trace included - wherever they sit. Drag a row or a group by its grip to move it
-      within its group or into another one. Colours carry over to results and charts.
+      within its group or into another one, and fold a group with the arrow to get it out of the
+      way. Colours carry over to results and charts.
     </div>
     <QueryGroup :group="root" :depth="0" />
   </div>
