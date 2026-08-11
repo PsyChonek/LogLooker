@@ -625,6 +625,15 @@ function extractedParts(hit: SearchHit): HighlightPart[] | null {
   return value;
 }
 
+// --- Single row: never let one hit wrap over several lines ---
+
+// Even clamped to ROW_CHARS, a long line wraps into a handful of visual lines, so
+// only a few hits fit on screen. With this on a collapsed row is exactly one line
+// tall, cut with an ellipsis; expanding the row still shows the line in full.
+const SINGLE_ROW_KEY = 'loglooker.singleRow';
+const singleRow = ref(localStorage.getItem(SINGLE_ROW_KEY) === '1');
+watch(singleRow, (on) => localStorage.setItem(SINGLE_ROW_KEY, on ? '1' : '0'));
+
 // --- What a collapsed row shows of the line ---
 
 // A single line can be megabytes (a serialised request payload). Rendered whole
@@ -1150,6 +1159,12 @@ onUnmounted(() => {
       >
         Extract match
       </BaseCheckbox>
+      <BaseCheckbox
+        v-model="singleRow"
+        title="Keep every hit one line tall, cut with an ellipsis. Click the row to see the whole line."
+      >
+        Single row
+      </BaseCheckbox>
       <button
         v-if="meta.totalHits > 0"
         class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
@@ -1251,21 +1266,28 @@ onUnmounted(() => {
             </div>
           </template>
           <template #line="{ row: hit }">
-            <template v-for="(part, p) in displayParts(hit)" :key="p">
-              <span v-if="part.slot !== null" :class="partClass(part)" :style="partStyle(part)">{{
-                part.text
-              }}</span
-              ><template v-else>
-                {{ part.text }}
-              </template>
-            </template>
-            <button
-              class="text-gray-400 text-[10px] whitespace-nowrap hover:text-blue-500 hover:underline"
-              title="Open the raw file at this line"
-              @click.stop="rawView = hit"
-            >
-              - {{ hit.file }}:{{ hit.lineNumber }}
-            </button>
+            <div :class="singleRow ? 'flex items-baseline gap-1' : ''">
+              <span :class="singleRow ? 'min-w-0 truncate' : ''">
+                <template v-for="(part, p) in displayParts(hit)" :key="p">
+                  <span
+                    v-if="part.slot !== null"
+                    :class="partClass(part)"
+                    :style="partStyle(part)"
+                    >{{ part.text }}</span
+                  ><template v-else>
+                    {{ part.text }}
+                  </template>
+                </template>
+              </span>
+              <button
+                class="text-gray-400 text-[10px] whitespace-nowrap hover:text-blue-500 hover:underline"
+                :class="singleRow ? 'shrink-0' : ''"
+                title="Open the raw file at this line"
+                @click.stop="rawView = hit"
+              >
+                - {{ hit.file }}:{{ hit.lineNumber }}
+              </button>
+            </div>
           </template>
           <template #expansion="{ row: hit }">
             <div class="px-3 py-2 bg-gray-50 dark:bg-gray-900/50">
