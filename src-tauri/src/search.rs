@@ -130,7 +130,7 @@ pub fn mask_to_groups(group_names: &[String], mask: u32) -> Vec<String> {
         .collect()
 }
 
-fn group_mask(group_names: &[String], matched: &[String]) -> u32 {
+pub fn group_mask(group_names: &[String], matched: &[String]) -> u32 {
     let mut mask = 0;
     for name in matched {
         if let Some(pos) = group_names.iter().position(|g| g == name) {
@@ -218,6 +218,12 @@ pub struct SearchResult {
 /// query builder's ALL/NOT criteria) fall back to the backtracking engine.
 pub struct Matcher {
     engine: Engine,
+    /// The query's leading negative look-aheads, lifted out of `engine` and run
+    /// on their own (see `split_leading_nots`). A hit is an entry, not a line,
+    /// so an exclusion has to veto every line of the entry - left inside the
+    /// pattern it would only reject the one line the excluded term sits on,
+    /// and the entry would still come back through its stack trace.
+    exclude: Option<Engine>,
     /// Named capture groups of the pattern, in definition order. Hits record
     /// which of them matched, so the UI can colour lines per group and charts
     /// can draw one series per group.
@@ -233,6 +239,90 @@ enum Engine {
     Fancy(fancy_regex::Regex),
 }
 
+impl Engine {
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Engine::All => true,
+            Engine::Substring(needle) => line.contains(needle.as_str()),
+            Engine::Pattern(regex) => regex.is_match(line),
+            Engine::Fancy(regex) => regex.is_match(line).unwrap_or(false),
+        }
+    }
+
+    fn group_names(&self) -> Vec<String> {
+        match self {
+            Engine::Pattern(regex) => regex.capture_names().flatten().map(str::to_string).collect(),
+            Engine::Fancy(regex) => regex.capture_names().flatten().map(str::to_string).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Compiles one pattern, falling back to the backtracking engine for the
+/// look-around the fast one refuses.
+fn compile_engine(pattern: &str, case_sensitive: bool) -> Result<Engine, String> {
+    let pattern = if case_sensitive {
+        pattern.to_string()
+    } else {
+        format!("(?i){pattern}")
+    };
+    match Regex::new(&pattern) {
+        Ok(regex) => Ok(Engine::Pattern(regex)),
+        Err(_) => match fancy_regex::Regex::new(&pattern) {
+            Ok(regex) => Ok(Engine::Fancy(regex)),
+            // The fancy engine accepts a superset of the syntax, so when both
+            // refuse the pattern its error names the real problem
+            Err(e) => Err(format!("Invalid regex: {e}")),
+        },
+    }
+}
+
+/// Splits `^(?!a)(?!b)rest` into `("^rest", "(?:a)|(?:b)")`: the run of negative
+/// look-aheads a query opens with, which are exclusions over the whole entry
+/// rather than over the line they are tested on, and the pattern left without
+/// them. `None` when the pattern does not open that way, so an ordinary query
+/// compiles exactly as before.
+fn split_leading_nots(pattern: &str) -> Option<(String, String)> {
+    let rest = pattern.strip_prefix('^')?;
+    let mut at = 0;
+    let mut nots: Vec<String> = Vec::new();
+    while let Some(body) = rest[at..].strip_prefix("(?!") {
+        let end = closing_paren(body)?;
+        nots.push(format!("(?:{})", &body[..end]));
+        at += "(?!".len() + end + 1;
+    }
+    if nots.is_empty() {
+        return None;
+    }
+    Some((format!("^{}", &rest[at..]), nots.join("|")))
+}
+
+/// Offset of the `)` closing the group whose body `text` starts, honouring
+/// escapes, nested groups and character classes (where a `)` is a literal).
+fn closing_paren(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 1,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => {
+                if depth == 0 {
+                    return Some(at);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
 /// Lines can hold megabytes of SQL or HTML; the per-group scan stops after this
 /// many matches instead of walking all of them.
 const GROUP_SCAN_CAP: usize = 200;
@@ -242,12 +332,14 @@ impl Matcher {
         if query.is_empty() {
             return Ok(Matcher {
                 engine: Engine::All,
+                exclude: None,
                 group_names: Vec::new(),
             });
         }
         if !is_regex && case_sensitive {
             return Ok(Matcher {
                 engine: Engine::Substring(query.to_string()),
+                exclude: None,
                 group_names: Vec::new(),
             });
         }
@@ -259,26 +351,23 @@ impl Matcher {
         } else {
             regex::escape(query)
         };
-        let pattern = if case_sensitive {
-            pattern
-        } else {
-            format!("(?i){pattern}")
-        };
-        match Regex::new(&pattern) {
-            Ok(regex) => Ok(Matcher {
-                group_names: regex.capture_names().flatten().map(str::to_string).collect(),
-                engine: Engine::Pattern(regex),
-            }),
-            Err(_) => match fancy_regex::Regex::new(&pattern) {
-                Ok(regex) => Ok(Matcher {
-                    group_names: regex.capture_names().flatten().map(str::to_string).collect(),
-                    engine: Engine::Fancy(regex),
-                }),
-                // The fancy engine accepts a superset of the syntax, so when
-                // both refuse the pattern its error names the real problem
-                Err(e) => Err(format!("Invalid regex: {e}")),
+        // The query builder puts its NOT criteria first for exactly this; a
+        // hand-written pattern that opens the same way gets the same treatment,
+        // which is the only reading that makes sense when a row is an entry.
+        let (pattern, excluded) = match split_leading_nots(&pattern) {
+            Some((rest, nots)) => match compile_engine(&nots, case_sensitive) {
+                Ok(engine) => (rest, Some(engine)),
+                // Unsplittable after all - run the pattern as the user wrote it
+                Err(_) => (pattern, None),
             },
-        }
+            None => (pattern, None),
+        };
+        let engine = compile_engine(&pattern, case_sensitive)?;
+        Ok(Matcher {
+            group_names: engine.group_names(),
+            engine,
+            exclude: excluded,
+        })
     }
 
     fn build(request: &SearchRequest) -> Result<Self, String> {
@@ -289,21 +378,31 @@ impl Matcher {
         &self.group_names
     }
 
+    /// Whether the query's exclusions reject this line. The scanner widens that
+    /// to the whole entry the line belongs to; line-at-a-time callers (the raw
+    /// viewer's in-file search) get the per-line reading `matches` always had.
+    pub fn excludes(&self, line: &str) -> bool {
+        self.exclude.as_ref().is_some_and(|engine| engine.is_match(line))
+    }
+
     pub fn matches(&self, line: &str) -> bool {
-        match &self.engine {
-            Engine::All => true,
-            Engine::Substring(needle) => line.contains(needle.as_str()),
-            Engine::Pattern(regex) => regex.is_match(line),
-            Engine::Fancy(regex) => regex.is_match(line).unwrap_or(false),
-        }
+        !self.excludes(line) && self.engine.is_match(line)
     }
 
     /// Match test that also reports which named groups took part anywhere in
     /// the line; `None` is no match. Patterns without named groups skip the
     /// capture cost entirely and behave exactly like `matches`.
     pub fn match_line(&self, line: &str) -> Option<Vec<String>> {
+        if self.excludes(line) {
+            return None;
+        }
+        self.match_line_included(line)
+    }
+
+    /// `match_line` for a line the caller has already cleared of exclusions.
+    fn match_line_included(&self, line: &str) -> Option<Vec<String>> {
         if self.group_names.is_empty() {
-            return self.matches(line).then(Vec::new);
+            return self.engine.is_match(line).then(Vec::new);
         }
         let mut found = vec![false; self.group_names.len()];
         let mut matched = false;
@@ -327,7 +426,7 @@ impl Matcher {
                 }
             }
             // All and Substring never carry groups
-            _ => return self.matches(line).then(Vec::new),
+            _ => return self.engine.is_match(line).then(Vec::new),
         }
         matched.then(|| {
             self.group_names
@@ -360,6 +459,20 @@ impl Matcher {
     /// As `extract`, but leaves out the named groups in `exclude` (those the user
     /// toggled off in the results legend), mirroring the frontend's buildExtractor.
     pub fn extract_excluding(&self, line: &str, exclude: &[String]) -> Option<String> {
+        // A hit's line is a whole entry - its header line plus every
+        // continuation line, newline-joined - and the scanner matched each of
+        // those on its own. Isolating over the join would miss every match on a
+        // stack-trace or SQL-body line, since `^` anchors at the entry's start
+        // and `.` stops at the first newline; the entry would then export as
+        // nothing at all. First line that yields a value wins, so a row still
+        // isolates one value.
+        if line.contains('\n') {
+            return line.lines().find_map(|own| self.extract_one(own, exclude));
+        }
+        self.extract_one(line, exclude)
+    }
+
+    fn extract_one(&self, line: &str, exclude: &[String]) -> Option<String> {
         match &self.engine {
             Engine::All | Engine::Substring(_) => None,
             Engine::Pattern(regex) => regex
@@ -1095,12 +1208,30 @@ fn scan_memory(
     let mut last_header_abs: Option<u64> = None;
     let mut first_header_ts = None;
     let mut last_ts = None;
+    // The entry still open at a chunk seam was excluded - by a line in the
+    // chunk's own head block, or by one an earlier chunk saw. Everything that
+    // entry contributed comes back out, wherever the contribution was made.
+    let mut open_excluded = false;
     for chunk in scanned {
-        let orphan = chunk.orphan;
+        let mut orphan = chunk.orphan;
         let chunk_hits = chunk.hits;
         let chunk_lines = chunk.lines;
         // Rows were numbered from this chunk's own start; concatenating shifts them
         let row_offset = columns.append(chunk.columns);
+
+        open_excluded |= chunk.head_excluded;
+        if open_excluded {
+            orphan = None;
+            match last_header_abs {
+                Some(header) => {
+                    if hits.last().is_some_and(|last: &CompactHit| last.line_number == header) {
+                        hits.pop();
+                    }
+                }
+                // Still inside the file's head block, which no header opened
+                None => head = None,
+            }
+        }
 
         if let Some(mut orphan) = orphan {
             orphan.row += row_offset;
@@ -1129,7 +1260,12 @@ fn scan_memory(
             push_or_merge(&mut hits, hit, &mut columns);
         }
         if let Some(header) = chunk.last_header {
+            // A header inside this chunk opened a fresh entry; whether the one
+            // left open at its end is excluded is the scanner's own verdict.
+            // Without a header the entry from before the chunk is still open,
+            // and so is the verdict already carried.
             last_header_abs = Some(header + lines_before);
+            open_excluded = chunk.tail_excluded;
         }
         if first_header_ts.is_none() {
             first_header_ts = chunk.first_header_ts;
@@ -1225,6 +1361,13 @@ struct ChunkScan {
     lines: u64,
     /// Line of the last entry header (timestamped line) seen, if any
     last_header: Option<u64>,
+    /// An exclusion hit the lines before this range's first header. The entry
+    /// they continue was opened - and may already have been recorded as a hit -
+    /// by an earlier chunk, so the stitching has to take that hit back out.
+    head_excluded: bool,
+    /// The entry still open at the end of the range was excluded, so the next
+    /// chunk's leading lines must not bring it back
+    tail_excluded: bool,
     /// Timestamp of the first header the range itself contains
     first_header_ts: Option<NaiveDateTime>,
     /// Timestamp state at the end of the range (its last header's, or the
@@ -1255,6 +1398,12 @@ struct Scanner<'a> {
     /// Line number of the current entry's header; 0 before the first
     /// timestamped line of the scanned range.
     entry_line: u64,
+    /// A line of the current entry hit an exclusion, so the entry is out
+    /// however well its other lines match. Cleared by the next header.
+    entry_excluded: bool,
+    /// The same, for the lines before this range's first header - their entry
+    /// opened in an earlier chunk, so the veto has to travel to the stitching.
+    head_excluded: bool,
     line_number: u64,
 }
 
@@ -1283,6 +1432,8 @@ impl<'a> Scanner<'a> {
             last_timestamp,
             first_header_ts: None,
             entry_line: 0,
+            entry_excluded: false,
+            head_excluded: false,
             line_number: 0,
         }
     }
@@ -1298,6 +1449,7 @@ impl<'a> Scanner<'a> {
                 self.first_header_ts = Some(ts);
             }
             self.entry_line = self.line_number;
+            self.entry_excluded = false;
         }
 
         // Lines before the range's first header cannot be dated yet - their
@@ -1323,7 +1475,18 @@ impl<'a> Scanner<'a> {
             return;
         }
 
-        if let Some(matched) = self.matcher.match_line(line) {
+        // An exclusion rejects the entry, not just the line carrying it: the
+        // "document" in an entry's URL must take its stack trace with it, or
+        // the trace's own lines would bring the entry back as a hit.
+        if self.matcher.excludes(line) {
+            self.exclude_entry();
+            return;
+        }
+        if self.entry_excluded {
+            return;
+        }
+
+        if let Some(matched) = self.matcher.match_line_included(line) {
             self.row.clear();
             extract_into(line, &self.file.spec.fields, &mut self.row);
             let matched_groups = group_mask(self.matcher.group_names(), &matched);
@@ -1375,6 +1538,23 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Drops the entry the current line belongs to. Its hit, if one was already
+    /// recorded, is the last one pushed - a hit is only ever appended for the
+    /// entry being scanned. The row behind it stays in the columns, unreferenced
+    /// like the rows a capped scan leaves; a second pass to reclaim it would
+    /// cost more than the few bytes it holds.
+    fn exclude_entry(&mut self) {
+        self.entry_excluded = true;
+        if self.entry_line == 0 {
+            self.head_excluded = true;
+            self.orphan = None;
+            return;
+        }
+        if self.hits.last().is_some_and(|last| last.line_number == self.entry_line) {
+            self.hits.pop();
+        }
+    }
+
     fn finish(self) -> ChunkScan {
         ChunkScan {
             hits: self.hits,
@@ -1382,6 +1562,8 @@ impl<'a> Scanner<'a> {
             columns: self.columns,
             lines: self.line_number,
             last_header: (self.entry_line > 0).then_some(self.entry_line),
+            head_excluded: self.head_excluded,
+            tail_excluded: self.entry_excluded,
             first_header_ts: self.first_header_ts,
             last_ts: self.last_timestamp,
         }
@@ -2303,7 +2485,7 @@ tail line\n";
         // The builder's ANY + NOT form: each positive in a lookahead with an
         // empty alternative - it always succeeds, but captures when present -
         // behind an "at least one occurs" assertion
-        let pattern = r"^(?=.*(?:ERROR|WARN))(?!.*noise)(?=.*(?<err>ERROR)|)(?=.*(?<warn>WARN)|)";
+        let pattern = r"^(?!.*noise)(?=.*(?:ERROR|WARN))(?=.*(?<err>ERROR)|)(?=.*(?<warn>WARN)|)";
         let matcher = Matcher::new(pattern, true, true).unwrap();
 
         assert_eq!(
@@ -2320,6 +2502,136 @@ tail line\n";
         let matcher = Matcher::new(r"^(?!.*noise).*(?<hit>ERROR)", true, true).unwrap();
         assert_eq!(matcher.match_line("an ERROR"), Some(vec!["hit".into()]));
         assert_eq!(matcher.match_line("noise ERROR"), None);
+    }
+
+    /// The leading `(?!...)` run is lifted out of the pattern so the scanner can
+    /// apply it to a whole entry; what is left must still be the same test.
+    #[test]
+    fn leading_negative_lookaheads_split_off_as_exclusions() {
+        assert_eq!(
+            split_leading_nots(r"^(?!.*a\)b)(?!.*[)])(?=.*?(?<hit>x))"),
+            Some((
+                r"^(?=.*?(?<hit>x))".to_string(),
+                r"(?:.*a\)b)|(?:.*[)])".to_string()
+            )),
+            "escapes, nested parens and classes do not end a lookahead early"
+        );
+        // Nothing to lift: unanchored, or the run does not open the pattern
+        assert_eq!(split_leading_nots(r"(?!.*a)b"), None);
+        assert_eq!(split_leading_nots(r"^(?=.*a)(?!.*b)"), None);
+
+        let matcher = Matcher::new(r"^(?!.*noise)(?=.*?(?<hit>ERROR))", true, true).unwrap();
+        assert_eq!(matcher.group_names(), ["hit"], "the groups survive the split");
+        assert!(matcher.excludes("noise here"));
+        assert!(!matcher.excludes("an ERROR"));
+        // Line-at-a-time callers keep the reading they always had
+        assert_eq!(matcher.match_line("an ERROR"), Some(vec!["hit".into()]));
+        assert_eq!(matcher.match_line("noise ERROR"), None);
+        assert!(!matcher.matches("noise ERROR"));
+    }
+
+    /// A hit is an entry, so an exclusion must take the whole entry with it -
+    /// header, SQL body and stack trace. Applying it to the matched line alone
+    /// let an excluded entry back in through one of its own trace lines.
+    #[test]
+    fn an_exclusion_drops_the_whole_entry_not_only_its_own_line() {
+        let text = b"14.07.2026 09:00:00.000 ERROR - deadlocked, URL: /v1/document/new\n\
+                     System.Exception: Transaction was deadlocked. Rerun the transaction.\n\
+                     14.07.2026 09:01:00.000 ERROR - deadlocked victim\n\
+                     System.Exception: at Document.New() in /src/Document/New.cs\n\
+                     14.07.2026 09:02:00.000 ERROR - deadlocked victim\n\
+                     System.Exception: Transaction was deadlocked. Rerun the transaction.\n\
+                     14.07.2026 09:03:00.000 INFO - document created\n\
+                     System.Exception: Transaction was deadlocked. Rerun the transaction.\n";
+        let file = scan_file_of("log-2026-07-14.log");
+        // What the builder compiles for "contains deadlock, does not contain document"
+        let matcher = Matcher::new(r"^(?!.*document)(?=.*?(?<name>deadlock))", true, false).unwrap();
+        let request = request_for(&file, "");
+
+        let scan = sequential_scan(&file, &matcher, &request, text);
+
+        assert_eq!(
+            scan.hits.iter().map(|hit| hit.line_number).collect::<Vec<_>>(),
+            vec![5],
+            "only the entry with no 'document' on any of its lines survives: the \
+             first is excluded by its header, the second by its stack trace after \
+             its header already matched, the last by the line the match sits on"
+        );
+    }
+
+    /// Entries long enough to straddle chunk boundaries, every third one closing
+    /// with its exclusion - so the line that vetoes an entry routinely lands in a
+    /// different chunk than the header it vetoes, and the veto has to travel
+    /// through the stitching.
+    fn excluded_parallel_text() -> Vec<u8> {
+        let mut text = String::with_capacity(PARALLEL_MIN_BYTES * 2);
+        let mut n = 0;
+        while text.len() < PARALLEL_MIN_BYTES * 2 {
+            n += 1;
+            let (s, m, h) = (n % 60, (n / 60) % 60, (n / 24) % 24);
+            text.push_str(&format!(
+                "14.07.2026 {h:02}:{m:02}:{s:02}.{:03} ERROR - BOOM at id={n}\n",
+                n % 1000
+            ));
+            for _ in 0..400 {
+                text.push_str("    at Example.Api.Handler.Handle()\n");
+            }
+            if n % 3 == 0 {
+                text.push_str("    at Noise.Retry.Handle()\n");
+            }
+        }
+        text.into_bytes()
+    }
+
+    #[test]
+    fn an_exclusion_crossing_a_chunk_boundary_still_drops_its_entry() {
+        let text = excluded_parallel_text();
+        let chunks = split_at_lines(&text, rayon::current_num_threads());
+        let starts: Vec<usize> = chunks.iter().skip(1).map(|chunk| chunk.start).collect();
+
+        // Entries, exclusions, and the exclusions cut off from their own header
+        let (mut entries, mut excluded, mut straddling) = (0, 0, 0);
+        let (mut header_at, mut at) = (0usize, 0usize);
+        for line in text.split_inclusive(|byte| *byte == b'\n') {
+            if line.starts_with(b"14.") {
+                entries += 1;
+                header_at = at;
+            }
+            if line.starts_with(b"    at Noise") {
+                excluded += 1;
+                if starts.iter().any(|start| *start > header_at && *start <= at) {
+                    straddling += 1;
+                }
+            }
+            at += line.len();
+        }
+        assert!(
+            chunks.len() == 1 || straddling > 0,
+            "the split must actually cut an entry off from its exclusion"
+        );
+
+        let file = scan_file_of("log-2026-07-14.log");
+        let matcher = Matcher::new(r"^(?!.*Noise)(?=.*?(?<hit>BOOM))", true, true).unwrap();
+        let request = request_for(&file, "");
+
+        let expected = sequential_scan(&file, &matcher, &request, &text);
+        assert_eq!(
+            expected.hits.len(),
+            entries - excluded,
+            "every entry but the excluded ones is a hit"
+        );
+
+        let actual = scan_memory(
+            &file,
+            &matcher,
+            &request,
+            &text,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_same_scan(&actual, &expected);
     }
 
     #[test]
@@ -2371,6 +2683,25 @@ tail line\n";
         let matcher = Matcher::new(r"\d+(\.\d+)?ms", true, true).unwrap();
         assert_eq!(matcher.extract("took 10.2848ms").as_deref(), Some("10.2848ms"));
         assert_eq!(matcher.extract("took 7ms").as_deref(), Some("7ms"));
+    }
+
+    /// A hit's line is the whole entry, and the scanner matched its lines one
+    /// by one - so the isolated value comes from whichever line matched, not
+    /// only from the header line the entry opens with.
+    #[test]
+    fn extract_reaches_a_match_on_a_continuation_line() {
+        let entry = "14.07.2026 10:00:00 info (sql) - insert into @Employees values\n\
+(1,'19859','Adhikari Amrita Kc'),\n\
+(2,'19860','Adhikari Muna'),";
+
+        // Plain pattern: the header line carries no match at all
+        let matcher = Matcher::new(r"'(?<name>Adhikari [^']+)'", true, true).unwrap();
+        assert_eq!(matcher.extract(entry).as_deref(), Some("Adhikari Amrita Kc"));
+
+        // The builder's ALL form, whose `^` and `.` both stop at the first
+        // newline when the entry is matched as one string
+        let matcher = Matcher::new(r"^(?=.*(?<a>Adhikari))(?=.*(?<b>19860))", true, false).unwrap();
+        assert_eq!(matcher.extract(entry).as_deref(), Some("Adhikari 19860"));
     }
 
     #[test]

@@ -29,16 +29,42 @@ export interface GroupNode {
   type: 'group';
   combinator: Combinator;
   children: QueryNode[];
+  // Optional name for the whole set, shown on the builder row and on the
+  // results legend chip; empty falls back to "Set 1", "Set 2", ...
+  label?: string;
+  // Muted like a criterion, but for the whole subtree: kept in the tree and
+  // storage, left out of the compiled regex, colour slots and highlighting
+  disabled?: boolean;
+  // Folded in the builder so its rows are out of the way. Purely a view state,
+  // persisted with the tree but ignored by everything that compiles it
+  collapsed?: boolean;
 }
 
 export type QueryNode = CriterionNode | GroupNode;
 
-// The chart palette has eight slots and never cycles; the builder keeps the
-// criterion count inside them so every criterion holds a colour of its own
-export const MAX_CRITERIA = 8;
+/** A nested group as the results legend sees it: one colour and the capture
+ * groups it owns, so the whole set toggles as a unit. */
+export interface QuerySet {
+  label: string;
+  slot: number;
+  names: string[];
+}
 
-// Nesting depth of the builder tree, root group included
-export const MAX_DEPTH = 4;
+// The chart palette. Criteria and groups take one slot each in tree order and
+// wrap around it, so a tree of any size and depth still colours every row - the
+// ninth criterion shares the first colour rather than capping the builder.
+//
+// The tree itself is uncapped. The one place size still shows is the backend's
+// per-hit group bitmask (search.rs), which records the first 32 capture groups:
+// past that a group still highlights and extracts (both client-side), but the
+// legend cannot hide lines only it matched and it gets no "Matched group"
+// chart series.
+export const PALETTE_SLOTS = 8;
+
+/** The palette slot a 1-based position wears, wrapping past the last colour. */
+export function paletteSlot(position: number): number {
+  return ((position - 1) % PALETTE_SLOTS) + 1;
+}
 
 const ESCAPE = /[.*+?^${}()|[\]\\]/g;
 
@@ -65,10 +91,60 @@ export function positiveGroupNames(positives: Criterion[]): string[] {
   return names;
 }
 
-/** All criterion rows of a builder tree in depth-first order. */
-export function flatCriteria(node: QueryNode): CriterionNode[] {
+/** The criterion rows that take part in the query, in depth-first order: a
+ * muted row is skipped, and so is every row inside a muted group. */
+export function enabledCriteria(node: QueryNode): CriterionNode[] {
+  if (node.disabled) return [];
   if (node.type === 'criterion') return [node];
-  return node.children.flatMap(flatCriteria);
+  return node.children.flatMap(enabledCriteria);
+}
+
+/** The nested groups of a tree in depth-first order, root excluded - the root
+ * is the query itself, so it carries no colour of its own and cannot be muted.
+ * Muted groups stay in the list so their colour does not shift when toggled. */
+export function flatGroups(root: GroupNode): GroupNode[] {
+  return root.children.flatMap((child) =>
+    child.type === 'group' ? [child, ...flatGroups(child)] : [],
+  );
+}
+
+/** Palette slot of every nested group, from the same eight colours the
+ * criteria use. Groups wear theirs as a border and a legend chip rather than a
+ * filled dot, so sharing a colour with a criterion still reads apart. */
+export function groupSlots(root: GroupNode): Map<GroupNode, number> {
+  return new Map(flatGroups(root).map((group, i) => [group, paletteSlot(i + 1)]));
+}
+
+/** The capture-group name of every criterion that compiles to one, in pattern
+ * order. Shared by the compiler and the set legend so both agree on names. */
+function captureNames(root: GroupNode): Map<CriterionNode, string> {
+  const positives = enabledCriteria(root).filter(
+    (criterion) => criterion.text !== '' && !isNegated(criterion.mode),
+  );
+  const names = positiveGroupNames(positives);
+  return new Map(positives.map((criterion, i) => [criterion, names[i]]));
+}
+
+/** One legend entry per nested group: its colour and the capture groups of the
+ * criteria inside it, subgroups included, so the results legend can switch a
+ * whole set off at once. Groups that contribute no capture group - muted, all
+ * negative, or empty - are left out. */
+export function querySets(root: GroupNode): QuerySet[] {
+  const nameOf = captureNames(root);
+  const slots = groupSlots(root);
+  const sets: QuerySet[] = [];
+  flatGroups(root).forEach((group, i) => {
+    const names = enabledCriteria(group)
+      .map((criterion) => nameOf.get(criterion))
+      .filter((name): name is string => name !== undefined);
+    if (names.length === 0) return;
+    sets.push({
+      label: group.label?.trim() || `Set ${i + 1}`,
+      slot: slots.get(group) ?? 1,
+      names,
+    });
+  });
+  return sets;
 }
 
 /** The boolean condition the tree expresses over the positive, non-empty
@@ -76,8 +152,9 @@ export function flatCriteria(node: QueryNode): CriterionNode[] {
  * single-child groups collapse into their only child. Null when nothing
  * positive remains. */
 function prune(node: QueryNode): QueryNode | null {
+  if (node.disabled) return null;
   if (node.type === 'criterion') {
-    return node.text !== '' && !isNegated(node.mode) && !node.disabled ? node : null;
+    return node.text !== '' && !isNegated(node.mode) ? node : null;
   }
   const children = node.children.map(prune).filter((child): child is QueryNode => child !== null);
   if (children.length === 0) return null;
@@ -101,7 +178,12 @@ function assertion(node: QueryNode): string {
 
 /**
  * Compiles the builder tree into a single plain regex. Negations always
- * exclude the whole line, wherever they sit in the tree.
+ * exclude the whole entry, wherever they sit in the tree: they compile to
+ * `(?!...)` right after the leading `^`, and the backend lifts that run of
+ * leading negative look-aheads out of the pattern and tests it against every
+ * line of an entry (a hit is an entry, so excluding only the line the term sits
+ * on would still let the entry through on one of its stack-trace lines).
+ * Keeping them at the front is what makes them liftable - do not move them.
  *
  * - Flat ANY without NOTs: `(?<a>A)|(?<b>B)` - plain alternation, fast engine.
  * - No ANY anywhere: `^(?=.*?(?<a>A))(?=.*?(?<b>B))` - one lookahead per
@@ -119,13 +201,10 @@ function assertion(node: QueryNode): string {
  *   criteria the line fails.
  */
 export function compileQuery(root: GroupNode): string {
-  const used = flatCriteria(root).filter(
-    (criterion) => criterion.text !== '' && !criterion.disabled,
-  );
+  const used = enabledCriteria(root).filter((criterion) => criterion.text !== '');
   const positives = used.filter((criterion) => !isNegated(criterion.mode));
   const negatives = used.filter((criterion) => isNegated(criterion.mode));
-  const names = positiveGroupNames(positives);
-  const nameOf = new Map(positives.map((criterion, i) => [criterion, names[i]]));
+  const nameOf = captureNames(root);
   const capture = (criterion: CriterionNode) => `(?<${nameOf.get(criterion)}>${body(criterion)})`;
   const nots = negatives.map((criterion) => `(?!.*${body(criterion)})`);
 
@@ -137,7 +216,7 @@ export function compileQuery(root: GroupNode): string {
   }
   const condition = prune(root) as QueryNode;
   if (!hasAlternation(condition)) {
-    return `^${positives.map((criterion) => `(?=.*?${capture(criterion)})`).join('')}${nots.join('')}`;
+    return `^${nots.join('')}${positives.map((criterion) => `(?=.*?${capture(criterion)})`).join('')}`;
   }
   const flatAny =
     condition.type === 'group' &&
@@ -157,7 +236,218 @@ export function compileQuery(root: GroupNode): string {
     // ANY: each child colours on its own; ALL: only when the group is satisfied
     return node.combinator === 'any' ? inner : `(?=${assertion(node)}${inner}|)`;
   };
-  return `^${assertion(condition)}${nots.join('')}${colorProbes(condition)}`;
+  return `^${nots.join('')}${assertion(condition)}${colorProbes(condition)}`;
+}
+
+// --- Parsing back ---
+//
+// The inverse of compileQuery, so a pattern the builder wrote - saved, reloaded
+// or hand-edited - opens back up as the criteria it came from instead of an
+// empty builder. Strict on purpose: anything that is not shaped like compiled
+// output returns null and the builder keeps the tree it had, rather than
+// mangling a hand-written regex into criteria that do not mean the same thing.
+// What the pattern does not carry is lost either way: muted rows, and the names
+// of groups that hold no criterion.
+
+const UNESCAPE = /\\([.*+?^${}()|[\]\\])/g;
+
+/** Index of the `)` closing the group that opens at `at`, honouring escapes and
+ * character classes (where a paren is a literal). -1 when it never closes. */
+function groupEnd(pattern: string, at: number): number {
+  let depth = 0;
+  let inClass = false;
+  for (let i = at; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (char === '\\') i++;
+    else if (inClass) {
+      if (char === ']') inClass = false;
+    } else if (char === '[') inClass = true;
+    else if (char === '(') depth++;
+    else if (char === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** Splits on the `|` that alternate the whole pattern - those outside every
+ * group and character class. */
+function splitAlternatives(source: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let inClass = false;
+  let start = 0;
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+    if (char === '\\') i++;
+    else if (inClass) {
+      if (char === ']') inClass = false;
+    } else if (char === '[') inClass = true;
+    else if (char === '(') depth++;
+    else if (char === ')') depth--;
+    else if (char === '|' && depth === 0) {
+      parts.push(source.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(source.slice(start));
+  return parts;
+}
+
+/** The top-level groups of `source`, in order. Null when anything sits between
+ * or outside them, which compiled output never has. */
+function topLevelGroups(source: string): string[] | null {
+  const groups: string[] = [];
+  let at = 0;
+  while (at < source.length) {
+    if (source[at] !== '(') return null;
+    const end = groupEnd(source, at);
+    if (end === -1) return null;
+    groups.push(source.slice(at, end + 1));
+    at = end + 1;
+  }
+  return groups;
+}
+
+/** The criterion row one compiled body came from: a body that is exactly an
+ * escaped literal was a "contains" row, anything else a regex one. */
+function criterionOf(body: string, negated: boolean): CriterionNode {
+  const text = body.replace(UNESCAPE, '$1');
+  const literal = text.replace(ESCAPE, '\\$&') === body;
+  const mode: CriterionMode = negated
+    ? literal
+      ? 'notContains'
+      : 'notRegex'
+    : literal
+      ? 'contains'
+      : 'regex';
+  return { type: 'criterion', mode, text: literal ? text : body, label: '' };
+}
+
+// g1, g2... are what an unlabelled criterion compiles to, so they read back as
+// no label rather than as one the user never typed
+function labelOf(name: string): string {
+  return /^g\d+$/.test(name) ? '' : name;
+}
+
+/** A whole-string `(?<name>body)`, the shape a lone positive criterion (or one
+ * branch of a flat OR) compiles to. */
+function wholeCapture(source: string): CriterionNode | null {
+  if (!source.startsWith('(?<') || groupEnd(source, 0) !== source.length - 1) return null;
+  const close = source.indexOf('>');
+  const name = source.slice(3, close);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return null;
+  const criterion = criterionOf(source.slice(close + 1, -1), false);
+  criterion.label = labelOf(name);
+  return criterion;
+}
+
+/** The named capture groups of a colour probe, in the order the probe lists
+ * them - which is the order the criteria sit in the tree. */
+function probeNames(probe: string): string[] {
+  return namedGroupsOf(probe);
+}
+
+/** One assertion group as a tree node: `(?=.*X)` and `(?=.*?(?<n>X))` are
+ * criteria, `(?:a|b)` is an ANY group whose branches are assertion sequences.
+ * Criteria that carry no name of their own take one from the probes later. */
+function parseAssertion(group: string): QueryNode | null {
+  if (group.startsWith('(?:')) {
+    const branches = splitAlternatives(group.slice(3, -1));
+    if (branches.length < 2) return null;
+    const children: QueryNode[] = [];
+    for (const branch of branches) {
+      const nodes = parseAssertions(branch);
+      if (!nodes) return null;
+      children.push(
+        nodes.length === 1 ? nodes[0] : { type: 'group', combinator: 'all', children: nodes },
+      );
+    }
+    return { type: 'group', combinator: 'any', children };
+  }
+  if (!group.startsWith('(?=')) return null;
+  const inner = group.slice(3, -1);
+  // The ALL form captures inline, so its criteria arrive already named
+  if (inner.startsWith('.*?(?<')) {
+    const capture = wholeCapture(inner.slice(3));
+    return capture;
+  }
+  if (!inner.startsWith('.*')) return null;
+  return criterionOf(inner.slice(2), false);
+}
+
+function parseAssertions(source: string): QueryNode[] | null {
+  const groups = topLevelGroups(source);
+  if (!groups) return null;
+  const nodes: QueryNode[] = [];
+  for (const group of groups) {
+    const node = parseAssertion(group);
+    if (!node) return null;
+    nodes.push(node);
+  }
+  return nodes;
+}
+
+/** Criteria of a tree in depth-first order - the order the compiler names them
+ * in, so probe names pair up with the criteria that lack one. */
+function parsedCriteria(node: QueryNode): CriterionNode[] {
+  return node.type === 'criterion' ? [node] : node.children.flatMap(parsedCriteria);
+}
+
+/**
+ * Reads a compiled pattern back into a builder tree, or null when the pattern
+ * was not compiled by the builder. Exclusions always land as the last rows of
+ * the root group, wherever the pattern put them, so reopening the builder does
+ * not shuffle the rows around.
+ */
+export function parseQuery(pattern: string): GroupNode | null {
+  if (!pattern) return null;
+
+  const single = wholeCapture(pattern);
+  if (single) return { type: 'group', combinator: 'all', children: [single] };
+
+  // A flat OR compiles to bare alternation
+  const alternatives = splitAlternatives(pattern);
+  if (alternatives.length > 1) {
+    const children = alternatives.map(wholeCapture);
+    if (children.some((child) => child === null)) return null;
+    return { type: 'group', combinator: 'any', children: children as CriterionNode[] };
+  }
+
+  if (!pattern.startsWith('^')) return null;
+  const groups = topLevelGroups(pattern.slice(1));
+  if (!groups) return null;
+
+  const nots: CriterionNode[] = [];
+  const structure: string[] = [];
+  const names: string[] = [];
+  for (const group of groups) {
+    if (group.startsWith('(?!.*')) {
+      nots.push(criterionOf(group.slice(5, -1), true));
+    } else if (group.startsWith('(?=') && group.endsWith('|)')) {
+      // A colour probe: it constrains nothing and only carries the names
+      names.push(...probeNames(group));
+    } else {
+      structure.push(group);
+    }
+  }
+
+  const parsed = structure.map(parseAssertion);
+  if (parsed.some((node) => node === null)) return null;
+  const nodes = parsed as QueryNode[];
+
+  // Criteria the assertion could not name take theirs from the probes, in the
+  // same depth-first order the compiler wrote them
+  const criteria = nodes.flatMap(parsedCriteria);
+  let next = 0;
+  for (const criterion of criteria) {
+    if (criterion.label === '' && next < names.length) criterion.label = labelOf(names[next++]);
+  }
+
+  if (criteria.length + nots.length === 0) return null;
+
+  // A lone OR group is the query itself; anything else hangs under an ALL root
+  return nodes.length === 1 && nodes[0].type === 'group' && nots.length === 0
+    ? nodes[0]
+    : { type: 'group', combinator: 'all', children: [...nodes, ...nots] };
 }
 
 // --- Highlighting ---
@@ -185,13 +475,13 @@ export function namedGroupsOf(pattern: string): string[] {
 export function slotClass(slot: number | null): string {
   if (slot === null) return '';
   if (slot === 0) return 'hl-match';
-  return `hl-${((slot - 1) % 8) + 1}`;
+  return `hl-${paletteSlot(slot)}`;
 }
 
 // The translucent fill a single slot paints, reused by the striped background
 function slotColor(slot: number): string {
   if (slot === 0) return 'color-mix(in srgb, #eab308 40%, transparent)';
-  return `color-mix(in srgb, var(--chart-${((slot - 1) % 8) + 1}) 40%, transparent)`;
+  return `color-mix(in srgb, var(--chart-${paletteSlot(slot)}) 40%, transparent)`;
 }
 
 /** The CSS class for a highlight part: the single slot colour, or none when the
@@ -236,8 +526,8 @@ export function buildExtractor(
   // Groups the user toggled off drop out of the isolated value, exactly as the
   // backend's Matcher::extract skips them, so the preview and the export agree.
   const names = namedGroupsOf(source).filter((name) => !disabled?.has(name));
-  return (line: string): string | null => {
-    const match = regex.exec(line);
+  const fromOwnLine = (own: string): string | null => {
+    const match = regex.exec(own);
     if (!match) return null;
     if (names.length === 0) return match[0];
     const joined = names
@@ -246,6 +536,20 @@ export function buildExtractor(
       .join(' ');
     return joined === '' ? match[0] : joined;
   };
+  // The line is a whole entry, matched line by line by the backend (see the
+  // highlighter): the value comes from the first of its lines that matches, so
+  // an entry whose match sits on a continuation line still isolates something.
+  return (line: string): string | null =>
+    line.includes('\n') ? firstOf(line, fromOwnLine) : fromOwnLine(line);
+}
+
+/** `pick` run over each physical line of an entry, first non-null wins. */
+function firstOf<T>(entry: string, pick: (line: string) => T | null): T | null {
+  for (const own of entry.split('\n')) {
+    const value = pick(own);
+    if (value !== null) return value;
+  }
+  return null;
 }
 
 /** Like buildExtractor, but keeps each capture group's colour instead of
@@ -270,8 +574,8 @@ export function buildExtractorParts(
   const slots = new Map(namedGroupsOf(source).map((name, i) => [name, i + 1]));
   const names = [...slots.keys()].filter((name) => !disabled?.has(name));
   const whole = (match: RegExpExecArray): HighlightPart[] => [{ text: match[0], slot: 0 }];
-  return (line: string): HighlightPart[] | null => {
-    const match = regex.exec(line);
+  const fromOwnLine = (own: string): HighlightPart[] | null => {
+    const match = regex.exec(own);
     if (!match) return null;
     if (names.length === 0) return whole(match);
     const parts: HighlightPart[] = [];
@@ -283,6 +587,9 @@ export function buildExtractorParts(
     }
     return parts.length === 0 ? whole(match) : parts;
   };
+  // Per physical line, exactly as buildExtractor
+  return (line: string): HighlightPart[] | null =>
+    line.includes('\n') ? firstOf(line, fromOwnLine) : fromOwnLine(line);
 }
 
 export interface Highlighter {
@@ -290,6 +597,10 @@ export interface Highlighter {
 }
 
 const PLAIN = (text: string): HighlightPart[] => [{ text, slot: null }];
+
+// Matches walked per entry before highlighting gives up: a 64 KB SQL body would
+// otherwise cost thousands of spans to paint runs nobody scrolls to.
+const MATCH_ROUNDS = 200;
 
 /** Splits lines into plain and matched segments, coloured by capture group.
  * Returns null when the query is empty or uses syntax JS regex lacks - the
@@ -314,15 +625,16 @@ export function buildHighlighter(
   // their zero-width match at every position would find nothing new
   const anchored = source.startsWith('^');
 
-  function parts(text: string): HighlightPart[] {
+  /** One physical line, split into plain and coloured runs. `budget` caps the
+   * matches walked, shared across an entry's lines by `parts`. */
+  function lineOwnParts(text: string, budget: { left: number }): HighlightPart[] {
     if (!text) return PLAIN(text);
     const spans: { start: number; end: number; slot: number }[] = [];
     regex.lastIndex = 0;
     let match: RegExpExecArray | null;
-    let rounds = 0;
     // Capped so a megabyte SQL body cannot stall rendering
-    while (rounds < 200 && (match = regex.exec(text))) {
-      rounds++;
+    while (budget.left > 0 && (match = regex.exec(text))) {
+      budget.left--;
       let namedSpans = 0;
       for (const [name, span] of Object.entries(match.indices?.groups ?? {})) {
         if (!span || span[1] <= span[0]) continue;
@@ -354,7 +666,11 @@ export function buildHighlighter(
       // striped part: two rules that share a filter text capture the same run,
       // so their colours must both show instead of one silently winning.
       const merged: number[] = [span.slot];
-      while (i + 1 < spans.length && spans[i + 1].start === span.start && spans[i + 1].end === span.end) {
+      while (
+        i + 1 < spans.length &&
+        spans[i + 1].start === span.start &&
+        spans[i + 1].end === span.end
+      ) {
         if (!merged.includes(spans[i + 1].slot)) merged.push(spans[i + 1].slot);
         i++;
       }
@@ -364,6 +680,24 @@ export function buildHighlighter(
       at = span.end;
     }
     if (at < text.length) result.push({ text: text.slice(at), slot: null });
+    return result;
+  }
+
+  /** A hit is a whole entry - its header line plus every continuation line,
+   * newline-joined - and the backend tested each of those lines on its own.
+   * The highlighter has to do the same: run over the join instead and `^` only
+   * anchors at the entry's first line while `.` never reaches past a newline,
+   * so a match sitting on a stack-trace or SQL-body line goes uncoloured
+   * everywhere, in the row and in the expanded view alike. */
+  function parts(text: string): HighlightPart[] {
+    const budget = { left: MATCH_ROUNDS };
+    if (!text.includes('\n')) return lineOwnParts(text, budget);
+    const result: HighlightPart[] = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) result.push({ text: '\n', slot: null });
+      if (lines[i]) result.push(...lineOwnParts(lines[i], budget));
+    }
     return result;
   }
 
