@@ -1,8 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { DATE_PRESETS, parseKey, toKey, type DatePreset, type PresetId } from '@/utils/dateRange';
 
 const from = defineModel<string>('from', { required: true });
 const to = defineModel<string>('to', { required: true });
+// Presets stay relative: the picker reports which one is active and the owner
+// resolves it to dates, so the range keeps following the calendar.
+const preset = defineModel<PresetId | null>('preset', { required: true });
 
 const WEEKDAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 const MONTHS = [
@@ -20,64 +24,26 @@ const MONTHS = [
   'December',
 ];
 
-function toKey(date: Date): string {
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${date.getFullYear()}-${month}-${day}`;
-}
-
-function parseKey(key: string): Date {
-  const [year, month, day] = key.split('-').map(Number);
-  return new Date(year, month - 1, day);
-}
-
-function daysAgo(count: number): Date {
-  const date = new Date();
-  date.setDate(date.getDate() - count);
-  return date;
-}
-
 function shortLabel(key: string): string {
   const date = parseKey(key);
   return `${date.getDate()} ${MONTHS[date.getMonth()].slice(0, 3)}`;
 }
-
-interface Preset {
-  label: string;
-  from: () => string;
-  to: () => string;
-}
-
-const PRESETS: Preset[] = [
-  { label: 'Today', from: () => toKey(new Date()), to: () => toKey(new Date()) },
-  { label: 'Yesterday', from: () => toKey(daysAgo(1)), to: () => toKey(daysAgo(1)) },
-  { label: 'Last 3 days', from: () => toKey(daysAgo(2)), to: () => toKey(new Date()) },
-  { label: 'Last 7 days', from: () => toKey(daysAgo(6)), to: () => toKey(new Date()) },
-  { label: 'Last 14 days', from: () => toKey(daysAgo(13)), to: () => toKey(new Date()) },
-  { label: 'Last 30 days', from: () => toKey(daysAgo(29)), to: () => toKey(new Date()) },
-  {
-    label: 'This month',
-    from: () => {
-      const date = new Date();
-      return toKey(new Date(date.getFullYear(), date.getMonth(), 1));
-    },
-    to: () => toKey(new Date()),
-  },
-];
 
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const cursor = ref(new Date());
 const pendingStart = ref<string | null>(null);
 const hovered = ref<string | null>(null);
-const todayKey = toKey(new Date());
+// Recomputed whenever the popover opens so the "today" ring survives a rollover
+// in a long-running window.
+const todayKey = ref(toKey(new Date()));
 
-const activePreset = computed(
-  () => PRESETS.find((p) => p.from() === from.value && p.to() === to.value)?.label ?? null,
+const activePresetLabel = computed(
+  () => DATE_PRESETS.find((p) => p.id === preset.value)?.label ?? null,
 );
 
 const triggerLabel = computed(() => {
-  if (activePreset.value) return activePreset.value;
+  if (activePresetLabel.value) return activePresetLabel.value;
   if (from.value === to.value) return shortLabel(from.value);
   return `${shortLabel(from.value)} - ${shortLabel(to.value)}`;
 });
@@ -144,6 +110,7 @@ function pickDay(key: string) {
     return;
   }
   const start = pendingStart.value;
+  preset.value = null;
   from.value = start <= key ? start : key;
   to.value = start <= key ? key : start;
   pendingStart.value = null;
@@ -151,9 +118,8 @@ function pickDay(key: string) {
   open.value = false;
 }
 
-function applyPreset(preset: Preset) {
-  from.value = preset.from();
-  to.value = preset.to();
+function applyPreset(picked: DatePreset) {
+  preset.value = picked.id;
   pendingStart.value = null;
   open.value = false;
 }
@@ -168,6 +134,7 @@ function toggle() {
 
 watch(open, (isOpen) => {
   if (isOpen) {
+    todayKey.value = toKey(new Date());
     cursor.value = parseKey(from.value);
     pendingStart.value = null;
     hovered.value = null;
@@ -241,18 +208,18 @@ onBeforeUnmount(() => {
         class="flex flex-col gap-0.5 p-2 w-32 border-r border-gray-100 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900/40"
       >
         <button
-          v-for="preset in PRESETS"
-          :key="preset.label"
+          v-for="item in DATE_PRESETS"
+          :key="item.id"
           type="button"
           class="px-2 py-1.5 text-left text-xs rounded-md transition-colors"
           :class="
-            activePreset === preset.label
+            preset === item.id
               ? 'bg-blue-500 text-white font-medium'
               : 'text-gray-600 dark:text-gray-400 hover:bg-gray-200/70 dark:hover:bg-gray-700 hover:text-gray-900 dark:hover:text-gray-100'
           "
-          @click="applyPreset(preset)"
+          @click="applyPreset(item)"
         >
-          {{ preset.label }}
+          {{ item.label }}
         </button>
       </div>
 

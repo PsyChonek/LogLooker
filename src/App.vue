@@ -47,7 +47,7 @@ function closeWindow() {
         <span class="font-mono text-gray-800 dark:text-gray-100">{{
           chartView.query || 'all lines'
         }}</span>
-        — follows the search in the main window
+        - follows the search in the main window
       </div>
       <SearchChart
         windowed
@@ -64,6 +64,7 @@ function closeWindow() {
                 { to: '/', label: 'Services' },
                 { to: '/search', label: 'Search' },
                 { to: '/files', label: 'Files' },
+                { to: '/plugins', label: 'Plugins' },
                 { to: '/log', label: 'Log' },
               ]"
               :key="link.to"
@@ -82,7 +83,11 @@ function closeWindow() {
           :notice="store.authNotice"
           @dismiss="store.authNotice = null"
         />
-        <router-view />
+        <router-view v-slot="{ Component }">
+          <keep-alive>
+            <component :is="Component" />
+          </keep-alive>
+        </router-view>
       </main>
     </template>
   </div>

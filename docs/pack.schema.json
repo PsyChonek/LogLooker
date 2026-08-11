@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/PsyChonek/LogLooker/main/docs/pack.schema.json",
+  "title": "LogLooker plugin pack",
+  "description": "Declarative description of a family of log sources: where services come from, where their logs live, how their lines parse, and what is worth searching and charting. See docs/PLUGINS.md.",
+  "type": "object",
+  "required": ["id", "name"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "id": {
+      "description": "Namespaces this pack's field keys and identifies it to services. Changing it orphans existing services.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string" },
+    "description": { "type": "string" },
+
+    "environments": {
+      "description": "Defaults to a single 'default' environment. An id is also a cache directory name.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "label": { "type": "string" }
+        }
+      }
+    },
+
+    "source": {
+      "description": "The transport. A pack picks one and configures it.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "kudu" },
+            "auth": {
+              "description": "Bearer token from 'az account get-access-token'; needs az login.",
+              "const": "az-cli"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "local-folder" },
+            "root": {
+              "description": "Prepended to a service's relative path; an absolute path ignores it.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+
+    "discovery": {
+      "description": "How the service list is filled in. Always optional, never authoritative.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": { "type": { "const": "none" } }
+        },
+        {
+          "type": "object",
+          "required": ["type", "services"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "static" },
+            "services": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "environment", "endpoint"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "environment": { "type": "string" },
+                  "endpoint": {
+                    "description": "Kudu base URL or folder path, per the pack's source.",
+                    "type": "string"
+                  },
+                  "location": {
+                    "description": "One of this pack's logLocations ids.",
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "url", "container"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "scrape" },
+            "url": { "type": "string", "pattern": "^https?://" },
+            "label": {
+              "description": "Button text. Defaults to 'Refresh from <url>'.",
+              "type": "string"
+            },
+            "container": {
+              "description": "Run over the whole page, once per service. Needs a (?<name>...) group; a (?<section>...) group is what environment rules match on.",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "Run over one service's block. Group 'endpoint', or the first plain group, is the URL or path.",
+              "type": "string"
+            },
+            "logDir": {
+              "description": "Run over one service's block. Group 'dir', or the first plain group, is matched against each log location's dir.",
+              "type": "string"
+            },
+            "environments": {
+              "description": "First rule whose 'contains' appears in the section text wins, case-insensitively.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["contains", "environment"],
+                "additionalProperties": false,
+                "properties": {
+                  "contains": { "type": "string" },
+                  "environment": { "type": "string" }
+                }
+              }
+            },
+            "defaultEnvironment": { "type": "string" }
+          }
+        }
+      ]
+    },
+
+    "logLocations": {
+      "description": "Probed in declaration order; the first with a matching file wins. Most specific first, catch-all last.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "dir", "file"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "label": { "type": "string" },
+          "dir": {
+            "description": "Directory relative to the service's endpoint; '.' is the endpoint itself.",
+            "type": "string"
+          },
+          "file": {
+            "description": "File name regex. Prefix (?i) for a case-insensitive name. An optional (?<instance>...) group marks a scale-out instance.",
+            "type": "string",
+            "format": "regex"
+          },
+          "dated": {
+            "description": "True (default): the name carries its day and 'file' needs y/m/d groups. False: undated growing files, filtered on line timestamps.",
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    },
+
+    "timestamps": {
+      "description": "Line-start formats to try, in order. Omit for every built-in. A 'regex' format runs on every line and is measurably slower than the named ones.",
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "enum": ["iso8601", "dotted-dmy", "us-mdy"] },
+          {
+            "type": "object",
+            "required": ["regex"],
+            "additionalProperties": false,
+            "properties": {
+              "regex": {
+                "description": "Needs named groups y, m, d, H, M, S; f (fractional seconds) is optional.",
+                "type": "string",
+                "format": "regex"
+              }
+            }
+          }
+        ]
+      }
+    },
+
+    "fields": {
+      "description": "Values pulled off a matching line; each becomes a result column, a sort key and a chart dimension. At most 32.",
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "required": ["key", "label", "regex"],
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "description": "Addressed as <packId>.<key>.",
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "label": { "type": "string" },
+          "gate": {
+            "description": "Literal the line must contain before the regex runs. Use it: extraction runs on every hit.",
+            "type": "string",
+            "minLength": 1
+          },
+          "regex": {
+            "description": "The value comes from group 'v', or from the first plain group.",
+            "type": "string",
+            "format": "regex"
+          },
+          "type": {
+            "description": "Only a 'number' field can be aggregated by a chart metric. A 'guid' is lowercased, and a value that is not one is dropped.",
+            "enum": ["string", "number", "guid"],
+            "default": "string"
+          }
+        }
+      }
+    },
+
+    "presets": {
+      "description": "Search queries offered alongside the user's saved ones.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "query"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "query": { "type": "string" },
+          "isRegex": { "type": "boolean", "default": false }
+        }
+      }
+    },
+
+    "charts": {
+      "description": "Ready-made charts. Field references use the local key, without the pack prefix.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "mode": { "enum": ["timeline", "category"], "default": "timeline" },
+          "bucket": {
+            "enum": [
+              "auto",
+              "second",
+              "minute",
+              "fiveMinutes",
+              "fifteenMinutes",
+              "hour",
+              "sixHours",
+              "day"
+            ],
+            "default": "auto"
+          },
+          "groupBy": {
+            "description": "'none', 'service', 'file', 'matchedGroup', 'custom', or 'field:<key>'.",
+            "type": "string",
+            "pattern": "^(none|service|file|matchedGroup|custom|field:[A-Za-z_][A-Za-z0-9_]*)$",
+            "default": "none"
+          },
+          "metric": {
+            "enum": ["count", "sum", "avg", "min", "max", "p50", "p95", "p99"],
+            "default": "count"
+          },
+          "value": {
+            "description": "Where a non-count metric's number comes from. Required unless the metric is 'count'.",
+            "type": "string",
+            "pattern": "^(custom|field:[A-Za-z_][A-Za-z0-9_]*)$"
+          },
+          "customRegex": {
+            "description": "Required by groupBy 'custom' or value 'custom'. Category is the (?<key>...) group, number the (?<value>...) group.",
+            "type": "string",
+            "format": "regex"
+          },
+          "topN": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  }
+}

@@ -3,12 +3,17 @@
 //! Runs over the full hit list held in `SearchState`, not over the pages the UI
 //! has loaded, so a chart always describes the whole result. Two shapes:
 //!
-//! - `Timeline` — x axis is a time bucket, one series per group (service,
+//! - `Timeline` - x axis is a time bucket, one series per group (service,
 //!   operation, ...). "Errors per hour, split by service."
-//! - `Category` — x axis is the group value itself, one bar each, ranked and
+//! - `Category` - x axis is the group value itself, one bar each, ranked and
 //!   cut to `top_n`. "Top 10 operations by p95 duration."
+//!
+//! What can be grouped or measured is not fixed here: a chart names one of the
+//! fields the loaded packs declare, so a pack for a different log shape brings
+//! its own dimensions with it.
 
-use crate::search::SearchHit;
+use crate::fields::{FieldColumns, FieldMeta};
+use crate::search::{self, CompactHit, ScanFile};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,7 +21,7 @@ use std::collections::HashMap;
 /// Auto bucketing aims for at most this many points; explicit bucket choices
 /// may produce more, up to MAX_BUCKETS.
 const TARGET_BUCKETS: i64 = 200;
-/// Hard cap — beyond this the SVG is unreadable and the payload pointless.
+/// Hard cap - beyond this the SVG is unreadable and the payload pointless.
 const MAX_BUCKETS: usize = 2000;
 const MAX_SERIES: usize = 50;
 
@@ -32,13 +37,14 @@ pub enum ChartMode {
 pub enum GroupBy {
     None,
     Service,
-    Operation,
-    IdLogin,
     File,
     Custom,
-    /// One series per named capture group of the search query — a hit that
+    /// One series per named capture group of the search query - a hit that
     /// matched several groups counts in each of them
     MatchedGroup,
+    /// One series per distinct value of a pack-declared field, named by its
+    /// column key (`<packId>.<field>`)
+    Field,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -68,8 +74,8 @@ impl Metric {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ValueSource {
-    /// The `duration_ms` extracted from MediatR timing lines
-    Duration,
+    /// A pack-declared field, named by `ChartRequest::value_field`
+    Field,
     /// The `value` capture group of the custom regex
     Custom,
 }
@@ -127,6 +133,12 @@ pub struct ChartRequest {
     pub custom_regex: Option<String>,
     pub metric: Metric,
     pub value_source: ValueSource,
+    /// Column key required by `GroupBy::Field`
+    #[serde(default)]
+    pub group_field: Option<String>,
+    /// Column key required by `ValueSource::Field`
+    #[serde(default)]
+    pub value_field: Option<String>,
     pub top_n: usize,
 }
 
@@ -134,7 +146,7 @@ pub struct ChartRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ChartSeries {
     pub name: String,
-    /// One entry per label. `None` is "no data in this bucket" — a gap in a
+    /// One entry per label. `None` is "no data in this bucket" - a gap in a
     /// line chart, no bar in a bar chart. Counts never produce gaps.
     pub values: Vec<Option<f64>>,
 }
@@ -158,12 +170,12 @@ pub struct ChartData {
     pub other_groups: usize,
     /// Minutes the charted labels run ahead of UTC. Buckets are cut from the log
     /// lines' own clock, so this is only known when every charted service shares
-    /// one — the aggregate itself cannot tell, so the command fills it in.
+    /// one - the aggregate itself cannot tell, so the command fills it in.
     pub log_offset_minutes: Option<i32>,
 }
 
 /// Streams the aggregate of one (series, bucket) cell. Raw values are only
-/// retained for percentiles — a count over millions of hits stays O(1) memory.
+/// retained for percentiles - a count over millions of hits stays O(1) memory.
 #[derive(Default)]
 struct Cell {
     count: u64,
@@ -212,7 +224,17 @@ fn percentile(values: &[f64], p: f64) -> Option<f64> {
     sorted.get(rank - 1).copied()
 }
 
-fn compile_custom(request: &ChartRequest) -> Result<Option<Regex>, String> {
+/// The custom regex's (key, value) capture of one hit's line, pre-extracted by
+/// the command layer - the compact hits hold no line text of their own.
+pub type CustomCapture = (Option<String>, Option<f64>);
+
+/// Whether the request needs the hit lines re-read (custom key or value).
+pub fn needs_lines(request: &ChartRequest) -> bool {
+    request.group_by == GroupBy::Custom
+        || (request.metric.needs_value() && request.value_source == ValueSource::Custom)
+}
+
+pub fn compile_custom(request: &ChartRequest) -> Result<Option<Regex>, String> {
     let needed = request.group_by == GroupBy::Custom
         || (request.metric.needs_value() && request.value_source == ValueSource::Custom);
     if !needed {
@@ -228,20 +250,20 @@ fn compile_custom(request: &ChartRequest) -> Result<Option<Regex>, String> {
         && regex.capture_names().flatten().all(|n| n != "key")
         && regex.captures_len() < 2
     {
-        return Err("The regex needs a capture group for the category — name it (?<key>...) or use the first group".into());
+        return Err("The regex needs a capture group for the category - name it (?<key>...) or use the first group".into());
     }
     if request.metric.needs_value()
         && request.value_source == ValueSource::Custom
         && regex.capture_names().flatten().all(|n| n != "value")
         && regex.captures_len() < 3
     {
-        return Err("The regex needs a capture group for the number — name it (?<value>...) or use the second group".into());
+        return Err("The regex needs a capture group for the number - name it (?<value>...) or use the second group".into());
     }
     Ok(Some(regex))
 }
 
 /// Pulls the category and the number out of one line in a single regex pass.
-fn custom_capture(regex: &Regex, line: &str) -> Option<(Option<String>, Option<f64>)> {
+pub fn custom_capture(regex: &Regex, line: &str) -> Option<CustomCapture> {
     let caps = regex.captures(line)?;
     let key = caps
         .name("key")
@@ -252,6 +274,25 @@ fn custom_capture(regex: &Regex, line: &str) -> Option<(Option<String>, Option<f
         .or_else(|| caps.get(2))
         .and_then(|m| m.as_str().trim().replace(',', ".").parse::<f64>().ok());
     Some((key, value))
+}
+
+/// The column a chart's field reference points at. A chart saved against a pack
+/// that is no longer loaded names a field that is not there, so this reports the
+/// key rather than silently charting nothing.
+fn resolve_field(
+    field_meta: &[FieldMeta],
+    key: Option<&str>,
+    what: &str,
+) -> Result<usize, String> {
+    let key = key.ok_or_else(|| format!("This chart needs a field in \"{what}\""))?;
+    field_meta
+        .iter()
+        .position(|meta| meta.key == key)
+        .ok_or_else(|| {
+            format!(
+                "No field \"{key}\" in this result - the plugin that declares it may be                  disabled, or the search covered no service that uses it"
+            )
+        })
 }
 
 /// Smallest bucket that keeps the span under TARGET_BUCKETS points.
@@ -265,10 +306,15 @@ fn auto_bucket(span_seconds: i64) -> i64 {
     86400
 }
 
-fn metric_label(request: &ChartRequest) -> String {
+fn metric_label(request: &ChartRequest, field_meta: &[FieldMeta]) -> String {
     let source = match request.value_source {
-        ValueSource::Duration => "duration (ms)",
-        ValueSource::Custom => "custom value",
+        ValueSource::Field => request
+            .value_field
+            .as_deref()
+            .and_then(|key| field_meta.iter().find(|m| m.key == key))
+            .map(|meta| meta.label.to_lowercase())
+            .unwrap_or_else(|| "value".into()),
+        ValueSource::Custom => "custom value".into(),
     };
     match request.metric {
         Metric::Count => "Hits".into(),
@@ -282,22 +328,45 @@ fn metric_label(request: &ChartRequest) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn aggregate(
-    hits: &[SearchHit],
+    hits: &[CompactHit],
+    files: &[ScanFile],
+    columns: &FieldColumns,
+    field_meta: &[FieldMeta],
+    custom: Option<&[Option<CustomCapture>]>,
     request: &ChartRequest,
     service_names: &HashMap<String, String>,
     group_names: &[String],
 ) -> Result<ChartData, String> {
-    let custom = compile_custom(request)?;
+    // Validates the pattern even though the captures come pre-extracted, so a
+    // bad regex still reads as its own error
+    let needs_custom = compile_custom(request)?.is_some();
+    if needs_custom && custom.is_none() {
+        return Err("Custom grouping needs the hit lines re-read first".into());
+    }
     let keep_values = request.metric.keeps_values();
     let top_n = request.top_n.clamp(1, MAX_SERIES);
 
     if request.group_by == GroupBy::MatchedGroup && group_names.is_empty() {
         return Err(
-            "The search query has no capture groups — build one with the query builder or write (?<name>...) groups"
+            "The search query has no capture groups - build one with the query builder or write (?<name>...) groups"
                 .into(),
         );
     }
+
+    // Field references are resolved once here rather than per hit: a chart over
+    // millions of hits should not look a column up by name that many times.
+    let group_column = match request.group_by {
+        GroupBy::Field => Some(resolve_field(field_meta, request.group_field.as_deref(), "groupField")?),
+        _ => None,
+    };
+    let value_column = match (request.metric.needs_value(), request.value_source) {
+        (true, ValueSource::Field) => {
+            Some(resolve_field(field_meta, request.value_field.as_deref(), "valueField")?)
+        }
+        _ => None,
+    };
 
     let mut skipped_no_time = 0;
     let mut skipped_no_value = 0;
@@ -310,14 +379,18 @@ pub fn aggregate(
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
 
-    // Pass 1 — extract (key, value, timestamp) per hit and note the time span.
+    // Pass 1 - extract (key, value, timestamp) per hit and note the time span.
     // Bucketing needs the span first when it is Auto, so keep the extracted
     // triples instead of re-parsing lines in pass 2.
     let mut points: Vec<(String, Option<f64>, i64)> = Vec::new();
 
-    for hit in hits {
-        let (custom_key, custom_value) = match &custom {
-            Some(regex) => custom_capture(regex, &hit.line).unwrap_or((None, None)),
+    for (index, hit) in hits.iter().enumerate() {
+        let (custom_key, custom_value) = match custom {
+            Some(captures) => captures
+                .get(index)
+                .cloned()
+                .flatten()
+                .unwrap_or((None, None)),
             None => (None, None),
         };
 
@@ -325,15 +398,17 @@ pub fn aggregate(
         // groups belongs to each of their series.
         let keys: Vec<String> = match request.group_by {
             GroupBy::None => vec!["All hits".to_string()],
-            GroupBy::Service => vec![service_names
-                .get(&hit.service_id)
-                .cloned()
-                .unwrap_or_else(|| hit.service_id.clone())],
-            GroupBy::Operation => hit.fields.operation.clone().into_iter().collect(),
-            GroupBy::IdLogin => hit.fields.id_login.clone().into_iter().collect(),
-            GroupBy::File => vec![hit.file.clone()],
+            GroupBy::Service => {
+                let id = &files[hit.file as usize].service_id;
+                vec![service_names.get(id).cloned().unwrap_or_else(|| id.clone())]
+            }
+            GroupBy::Field => group_column
+                .and_then(|column| columns.display(column, hit.row))
+                .into_iter()
+                .collect(),
+            GroupBy::File => vec![files[hit.file as usize].name.clone()],
             GroupBy::Custom => custom_key.into_iter().collect(),
-            GroupBy::MatchedGroup => hit.matched_groups.clone(),
+            GroupBy::MatchedGroup => search::mask_to_groups(group_names, hit.matched_groups),
         };
         if keys.is_empty() {
             skipped_no_key += 1;
@@ -342,7 +417,7 @@ pub fn aggregate(
 
         let value = if request.metric.needs_value() {
             let value = match request.value_source {
-                ValueSource::Duration => hit.fields.duration_ms,
+                ValueSource::Field => value_column.and_then(|column| columns.number(column, hit.row)),
                 ValueSource::Custom => custom_value,
             };
             if value.is_none() {
@@ -380,7 +455,7 @@ pub fn aggregate(
             series: Vec::new(),
             bucket_seconds: 0,
             bucket_label: String::new(),
-            metric_label: metric_label(request),
+            metric_label: metric_label(request, field_meta),
             charted: 0,
             skipped_no_time,
             skipped_no_value,
@@ -400,7 +475,7 @@ pub fn aggregate(
         let count = ((max_ts - min_ts) / bucket_seconds) as usize + 1;
         if count > MAX_BUCKETS {
             return Err(format!(
-                "{count} buckets of {} would be unreadable — pick a coarser bucket",
+                "{count} buckets of {} would be unreadable - pick a coarser bucket",
                 Bucket::label(bucket_seconds)
             ));
         }
@@ -409,7 +484,7 @@ pub fn aggregate(
     // Rank groups. Timeline series are ranked by hit count (a series that is
     // rare overall does not deserve a colour); category bars by the metric
     // itself, so "top 10 by p95" means what it says. Matched groups instead
-    // keep pattern order — their colour must match the query editor and the
+    // keep pattern order - their colour must match the query editor and the
     // highlighted hits, and a group that never matched still shows as flat.
     let mut ranked: Vec<String> = if request.group_by == GroupBy::MatchedGroup {
         group_names.to_vec()
@@ -417,7 +492,7 @@ pub fn aggregate(
         group_counts.keys().cloned().collect()
     };
 
-    // Pass 2 — fill the cells.
+    // Pass 2 - fill the cells.
     for (key, value, epoch) in &points {
         let bucket = if bucket_seconds > 0 {
             epoch - epoch.rem_euclid(bucket_seconds)
@@ -522,7 +597,7 @@ pub fn aggregate(
             (
                 ranked.clone(),
                 vec![ChartSeries {
-                    name: metric_label(request),
+                    name: metric_label(request, field_meta),
                     values,
                 }],
             )
@@ -538,7 +613,7 @@ pub fn aggregate(
         } else {
             String::new()
         },
-        metric_label: metric_label(request),
+        metric_label: metric_label(request, field_meta),
         charted,
         skipped_no_time,
         skipped_no_value,
@@ -551,25 +626,87 @@ pub fn aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::ExtractedFields;
+    use crate::fields::{Extracted, FieldRow};
+    use crate::plugin::FieldType;
     use chrono::NaiveDateTime;
+    use std::path::PathBuf;
 
-    fn hit(service: &str, ts: Option<&str>, line: &str, duration: Option<f64>) -> SearchHit {
-        SearchHit {
-            service_id: service.into(),
-            file: "log-2026-07-14.log".into(),
-            line_number: 1,
-            timestamp: ts.map(|t| NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S").unwrap()),
-            line: line.into(),
-            context_before: Vec::new(),
-            context_after: Vec::new(),
-            fields: ExtractedFields {
-                duration_ms: duration,
-                operation: Some("PostOrder".into()),
-                ..Default::default()
+    /// The two columns these tests chart by, standing in for whatever fields a
+    /// pack happens to declare: one text dimension and one number to aggregate.
+    const OP: &str = "test.operation";
+    const MS: &str = "test.durationMs";
+
+    fn meta() -> Vec<FieldMeta> {
+        vec![
+            FieldMeta {
+                key: OP.into(),
+                label: "Operation".into(),
+                kind: FieldType::String,
             },
-            matched_groups: Vec::new(),
+            FieldMeta {
+                key: MS.into(),
+                label: "duration (ms)".into(),
+                kind: FieldType::Number,
+            },
+        ]
+    }
+
+    fn scan_file(service: &str) -> ScanFile {
+        ScanFile {
+            service_id: service.into(),
+            path: PathBuf::from("log-2026-07-14.log.zst"),
+            name: "log-2026-07-14.log".into(),
+            uncompressed_size: 0,
+            log_offset_minutes: None,
+            filter_lines_by_date: false,
+            date: None,
+            instance: None,
+            spec: std::sync::Arc::new(crate::search::PackScanSpec::default()),
         }
+    }
+
+    /// One test hit: file, timestamp, the number to aggregate, the text to group
+    /// by. Hits and their column rows are built together, so the tests read
+    /// values back through the same indirection the app does.
+    type Row<'a> = (u32, Option<&'a str>, Option<f64>, Option<&'a str>);
+
+    fn fixture(rows: &[Row]) -> (Vec<CompactHit>, FieldColumns) {
+        let metas = meta();
+        let mut columns = FieldColumns::new(&metas);
+        let mut row = FieldRow::new(metas.len());
+        let mut hits = Vec::with_capacity(rows.len());
+        for (file, ts, duration, operation) in rows {
+            row.clear();
+            if let Some(operation) = operation {
+                row.set(0, Extracted::Text(operation));
+            }
+            if let Some(duration) = duration {
+                row.set(1, Extracted::Number(*duration));
+            }
+            hits.push(CompactHit {
+                file: *file,
+                line_number: 1,
+                timestamp: ts
+                    .map(|t| NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S").unwrap()),
+                matched_groups: 0,
+                row: columns.push_row(&row),
+            });
+        }
+        (hits, columns)
+    }
+
+    fn no_columns() -> FieldColumns {
+        FieldColumns::new(&meta())
+    }
+
+    /// What the command layer does for custom charts: run the request's regex
+    /// over each hit's line text and hand the captures to `aggregate`.
+    fn captures_of(request: &ChartRequest, lines: &[&str]) -> Vec<Option<CustomCapture>> {
+        let regex = compile_custom(request).unwrap().unwrap();
+        lines
+            .iter()
+            .map(|line| Some(custom_capture(&regex, line).unwrap_or((None, None))))
+            .collect()
     }
 
     fn request(mode: ChartMode, group_by: GroupBy, metric: Metric) -> ChartRequest {
@@ -579,19 +716,22 @@ mod tests {
             group_by,
             custom_regex: None,
             metric,
-            value_source: ValueSource::Duration,
+            value_source: ValueSource::Field,
+            group_field: Some(OP.into()),
+            value_field: Some(MS.into()),
             top_n: 10,
         }
     }
 
     #[test]
     fn counts_hits_per_bucket_and_fills_gaps_with_zero() {
-        let hits = vec![
-            hit("a", Some("2026-07-14T10:05:00"), "boom", None),
-            hit("a", Some("2026-07-14T10:59:00"), "boom", None),
-            hit("a", Some("2026-07-14T12:00:00"), "boom", None),
-        ];
-        let data = aggregate(&hits, &request(ChartMode::Timeline, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:05:00"), None, None),
+            (0, Some("2026-07-14T10:59:00"), None, None),
+            (0, Some("2026-07-14T12:00:00"), None, None),
+        ]);
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &request(ChartMode::Timeline, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
 
         assert_eq!(data.labels.len(), 3, "10:00, 11:00 (empty), 12:00");
         assert_eq!(data.series.len(), 1);
@@ -601,16 +741,17 @@ mod tests {
 
     #[test]
     fn splits_series_by_service_using_display_names() {
-        let hits = vec![
-            hit("test/client-api", Some("2026-07-14T10:05:00"), "boom", None),
-            hit("test/internal-api", Some("2026-07-14T10:07:00"), "boom", None),
-            hit("test/client-api", Some("2026-07-14T10:09:00"), "boom", None),
-        ];
+        let files = vec![scan_file("test/client-api"), scan_file("test/internal-api")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:05:00"), None, None),
+            (1, Some("2026-07-14T10:07:00"), None, None),
+            (0, Some("2026-07-14T10:09:00"), None, None),
+        ]);
         let names = HashMap::from([
             ("test/client-api".to_string(), "client-api".to_string()),
             ("test/internal-api".to_string(), "internal-api".to_string()),
         ]);
-        let data = aggregate(&hits, &request(ChartMode::Timeline, GroupBy::Service, Metric::Count), &names, &[]).unwrap();
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &request(ChartMode::Timeline, GroupBy::Service, Metric::Count), &names, &[]).unwrap();
 
         assert_eq!(data.series.len(), 2);
         // Ranked by hit count, so the two-hit service leads
@@ -622,12 +763,13 @@ mod tests {
 
     #[test]
     fn averages_duration_and_leaves_empty_buckets_as_gaps() {
-        let hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "done", Some(100.0)),
-            hit("a", Some("2026-07-14T10:30:00"), "done", Some(300.0)),
-            hit("a", Some("2026-07-14T12:00:00"), "done", Some(50.0)),
-        ];
-        let data = aggregate(&hits, &request(ChartMode::Timeline, GroupBy::None, Metric::Avg), &HashMap::new(), &[]).unwrap();
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), Some(100.0), None),
+            (0, Some("2026-07-14T10:30:00"), Some(300.0), None),
+            (0, Some("2026-07-14T12:00:00"), Some(50.0), None),
+        ]);
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &request(ChartMode::Timeline, GroupBy::None, Metric::Avg), &HashMap::new(), &[]).unwrap();
 
         assert_eq!(data.series[0].values, vec![Some(200.0), None, Some(50.0)]);
         assert_eq!(data.metric_label, "Avg duration (ms)");
@@ -635,11 +777,12 @@ mod tests {
 
     #[test]
     fn hits_without_a_value_are_skipped_not_zeroed() {
-        let hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "done", Some(100.0)),
-            hit("a", Some("2026-07-14T10:10:00"), "no duration here", None),
-        ];
-        let data = aggregate(&hits, &request(ChartMode::Timeline, GroupBy::None, Metric::Avg), &HashMap::new(), &[]).unwrap();
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), Some(100.0), None),
+            (0, Some("2026-07-14T10:10:00"), None, None),
+        ]);
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &request(ChartMode::Timeline, GroupBy::None, Metric::Avg), &HashMap::new(), &[]).unwrap();
 
         assert_eq!(data.series[0].values, vec![Some(100.0)]);
         assert_eq!(data.skipped_no_value, 1);
@@ -657,18 +800,16 @@ mod tests {
 
     #[test]
     fn category_mode_ranks_bars_by_the_metric_and_cuts_to_top_n() {
-        let mut hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "slow", Some(900.0)),
-            hit("a", Some("2026-07-14T10:01:00"), "medium", Some(500.0)),
-            hit("a", Some("2026-07-14T10:02:00"), "fast", Some(10.0)),
-        ];
-        hits[0].fields.operation = Some("SlowOp".into());
-        hits[1].fields.operation = Some("MediumOp".into());
-        hits[2].fields.operation = Some("FastOp".into());
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), Some(900.0), Some("SlowOp")),
+            (0, Some("2026-07-14T10:01:00"), Some(500.0), Some("MediumOp")),
+            (0, Some("2026-07-14T10:02:00"), Some(10.0), Some("FastOp")),
+        ]);
 
-        let mut req = request(ChartMode::Category, GroupBy::Operation, Metric::Max);
+        let mut req = request(ChartMode::Category, GroupBy::Field, Metric::Max);
         req.top_n = 2;
-        let data = aggregate(&hits, &req, &HashMap::new(), &[]).unwrap();
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &req, &HashMap::new(), &[]).unwrap();
 
         assert_eq!(data.labels, vec!["SlowOp", "MediumOp"]);
         assert_eq!(data.series.len(), 1);
@@ -678,16 +819,23 @@ mod tests {
 
     #[test]
     fn custom_regex_groups_by_key_and_aggregates_the_captured_number() {
-        let hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "GET /orders took 120 ms", None),
-            hit("a", Some("2026-07-14T10:01:00"), "GET /orders took 180 ms", None),
-            hit("a", Some("2026-07-14T10:02:00"), "GET /users took 40 ms", None),
-            hit("a", Some("2026-07-14T10:03:00"), "unrelated line", None),
-        ];
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), None, None),
+            (0, Some("2026-07-14T10:01:00"), None, None),
+            (0, Some("2026-07-14T10:02:00"), None, None),
+            (0, Some("2026-07-14T10:03:00"), None, None),
+        ]);
         let mut req = request(ChartMode::Category, GroupBy::Custom, Metric::Avg);
         req.custom_regex = Some(r"GET (?<key>\S+) took (?<value>\d+) ms".into());
         req.value_source = ValueSource::Custom;
-        let data = aggregate(&hits, &req, &HashMap::new(), &[]).unwrap();
+        let captures = captures_of(&req, &[
+            "GET /orders took 120 ms",
+            "GET /orders took 180 ms",
+            "GET /users took 40 ms",
+            "unrelated line",
+        ]);
+        let data = aggregate(&hits, &files, &columns, &meta(), Some(&captures), &req, &HashMap::new(), &[]).unwrap();
 
         assert_eq!(data.labels, vec!["/orders", "/users"]);
         assert_eq!(data.series[0].values, vec![Some(150.0), Some(40.0)]);
@@ -696,11 +844,13 @@ mod tests {
 
     #[test]
     fn custom_regex_falls_back_to_positional_groups() {
-        let hits = vec![hit("a", Some("2026-07-14T10:00:00"), "op=Sync ms=250", None)];
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[(0, Some("2026-07-14T10:00:00"), None, None)]);
         let mut req = request(ChartMode::Category, GroupBy::Custom, Metric::Sum);
         req.custom_regex = Some(r"op=(\w+) ms=(\d+)".into());
         req.value_source = ValueSource::Custom;
-        let data = aggregate(&hits, &req, &HashMap::new(), &[]).unwrap();
+        let captures = captures_of(&req, &["op=Sync ms=250"]);
+        let data = aggregate(&hits, &files, &columns, &meta(), Some(&captures), &req, &HashMap::new(), &[]).unwrap();
 
         assert_eq!(data.labels, vec!["Sync"]);
         assert_eq!(data.series[0].values, vec![Some(250.0)]);
@@ -709,20 +859,21 @@ mod tests {
     #[test]
     fn custom_grouping_without_a_regex_is_an_error() {
         let req = request(ChartMode::Category, GroupBy::Custom, Metric::Count);
-        assert!(aggregate(&[], &req, &HashMap::new(), &[]).is_err());
+        assert!(aggregate(&[], &[], &no_columns(), &meta(), None, &req, &HashMap::new(), &[]).is_err());
     }
 
     #[test]
     fn undatable_hits_are_skipped_on_a_timeline_but_counted_in_a_category() {
-        let hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "boom", None),
-            hit("a", None, "continuation line", None),
-        ];
-        let timeline = aggregate(&hits, &request(ChartMode::Timeline, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), None, None),
+            (0, None, None, None),
+        ]);
+        let timeline = aggregate(&hits, &files, &columns, &meta(), None, &request(ChartMode::Timeline, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
         assert_eq!(timeline.skipped_no_time, 1);
         assert_eq!(timeline.charted, 1);
 
-        let category = aggregate(&hits, &request(ChartMode::Category, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
+        let category = aggregate(&hits, &files, &columns, &meta(), None, &request(ChartMode::Category, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
         assert_eq!(category.skipped_no_time, 0);
         assert_eq!(category.charted, 2);
     }
@@ -737,30 +888,32 @@ mod tests {
 
     #[test]
     fn too_many_buckets_is_a_readable_error_not_a_giant_payload() {
-        let hits = vec![
-            hit("a", Some("2026-01-01T00:00:00"), "boom", None),
-            hit("a", Some("2026-07-14T00:00:00"), "boom", None),
-        ];
+        let files = vec![scan_file("a")];
+        let (hits, columns) = fixture(&[
+            (0, Some("2026-01-01T00:00:00"), None, None),
+            (0, Some("2026-07-14T00:00:00"), None, None),
+        ]);
         let mut req = request(ChartMode::Timeline, GroupBy::None, Metric::Count);
         req.bucket = Bucket::Minute;
-        let error = aggregate(&hits, &req, &HashMap::new(), &[]).unwrap_err();
+        let error = aggregate(&hits, &files, &columns, &meta(), None, &req, &HashMap::new(), &[]).unwrap_err();
         assert!(error.contains("coarser bucket"), "{error}");
     }
 
     #[test]
     fn matched_groups_chart_one_series_per_group_in_pattern_order() {
         let names = vec!["err".to_string(), "warn".to_string(), "silent".to_string()];
-        let mut hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "WARN thing", None),
-            hit("a", Some("2026-07-14T10:01:00"), "ERROR boom", None),
-            hit("a", Some("2026-07-14T10:02:00"), "WARN then ERROR", None),
-        ];
-        hits[0].matched_groups = vec!["warn".into()];
-        hits[1].matched_groups = vec!["err".into()];
-        hits[2].matched_groups = vec!["err".into(), "warn".into()];
+        let files = vec![scan_file("a")];
+        let (mut hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), None, None),
+            (0, Some("2026-07-14T10:01:00"), None, None),
+            (0, Some("2026-07-14T10:02:00"), None, None),
+        ]);
+        hits[0].matched_groups = 0b010; // warn
+        hits[1].matched_groups = 0b001; // err
+        hits[2].matched_groups = 0b011; // both
 
         let req = request(ChartMode::Timeline, GroupBy::MatchedGroup, Metric::Count);
-        let data = aggregate(&hits, &req, &HashMap::new(), &names).unwrap();
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &req, &HashMap::new(), &names).unwrap();
 
         // Pattern order, not count order; a group with no hits still shows
         let series_names: Vec<&str> = data.series.iter().map(|s| s.name.as_str()).collect();
@@ -774,28 +927,29 @@ mod tests {
     #[test]
     fn matched_groups_without_any_groups_in_the_query_is_an_error() {
         let req = request(ChartMode::Timeline, GroupBy::MatchedGroup, Metric::Count);
-        let error = aggregate(&[], &req, &HashMap::new(), &[]).unwrap_err();
+        let error = aggregate(&[], &[], &no_columns(), &meta(), None, &req, &HashMap::new(), &[]).unwrap_err();
         assert!(error.contains("capture groups"), "{error}");
     }
 
     #[test]
     fn hits_that_matched_no_group_are_reported_as_skipped() {
         let names = vec!["err".to_string()];
-        let mut hits = vec![
-            hit("a", Some("2026-07-14T10:00:00"), "ERROR boom", None),
-            hit("a", Some("2026-07-14T10:01:00"), "context line", None),
-        ];
-        hits[0].matched_groups = vec!["err".into()];
+        let files = vec![scan_file("a")];
+        let (mut hits, columns) = fixture(&[
+            (0, Some("2026-07-14T10:00:00"), None, None),
+            (0, Some("2026-07-14T10:01:00"), None, None),
+        ]);
+        hits[0].matched_groups = 0b1;
 
         let req = request(ChartMode::Timeline, GroupBy::MatchedGroup, Metric::Count);
-        let data = aggregate(&hits, &req, &HashMap::new(), &names).unwrap();
+        let data = aggregate(&hits, &files, &columns, &meta(), None, &req, &HashMap::new(), &names).unwrap();
         assert_eq!(data.skipped_no_key, 1);
         assert_eq!(data.charted, 1);
     }
 
     #[test]
     fn empty_result_charts_as_nothing_rather_than_failing() {
-        let data = aggregate(&[], &request(ChartMode::Timeline, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
+        let data = aggregate(&[], &[], &no_columns(), &meta(), None, &request(ChartMode::Timeline, GroupBy::None, Metric::Count), &HashMap::new(), &[]).unwrap();
         assert!(data.labels.is_empty());
         assert!(data.series.is_empty());
         assert_eq!(data.charted, 0);

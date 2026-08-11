@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Catches dependency and toolchain rot on a repo that can sit quiet for weeks
+  schedule:
+    - cron: '0 2 * * *' # 02:00 UTC nightly
+  # Called by the release workflow so a release runs the same gates
+  workflow_call:
+
+# Only the newest run per branch matters; a superseded one is wasted minutes
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (typecheck, lint, bundle)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # The bundle is what the MSI ships, so a build failure has to fail CI and
+      # not wait until release time to show up
+      - name: Bundle
+        run: npx vite build
+
+  rust:
+    name: Rust (tests)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # tauri::generate_context! reads tauri.conf.json, whose beforeBuildCommand
+      # points at the frontend bundle - so the crate needs node deps present even
+      # to compile its tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Rust tests
+        run: npm run test:rust

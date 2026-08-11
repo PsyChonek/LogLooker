@@ -1,18 +1,46 @@
-//! Drives `search::run` over a hand-built cache directory — the same code path
+//! Drives `search::run` over a hand-built cache directory - the same code path
 //! the app uses, without Kudu or the network. Covers the memory cache: a search
 //! must return the same hits whether the files come from RAM or from disk.
 
 use log_looker_lib::cache::{CachedFile, Manifest};
 use log_looker_lib::config::{ServiceConfig, ServiceSource};
 use log_looker_lib::memcache::MemCache;
-use log_looker_lib::scraper::Environment;
-use log_looker_lib::search::{self, SearchRequest, SearchResult};
+use log_looker_lib::plugin::{self, PackOrigin, Registry};
+use log_looker_lib::search::{self, SearchRequest, SearchResult, SearchSpec};
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// The pack the fixture service belongs to. Its two fields are what the search
+/// must extract, so the test covers the whole declared-parsing path rather than
+/// assuming any field exists.
+const PACK: &str = r#"{
+    "id": "fixture", "name": "Fixture", "source": { "type": "local-folder" },
+    "environments": [ { "id": "test", "label": "TEST" } ],
+    "timestamps": ["dotted-dmy"],
+    "fields": [
+      { "key": "operation", "label": "Operation", "gate": "Handling ",
+        "regex": "Handling (?<v>\\w+)" },
+      { "key": "idLogin", "label": "Login", "gate": "ID_Login", "type": "guid",
+        "regex": "ID_Login[:=](?<v>[0-9a-fA-F-]{36})" }
+    ]
+}"#;
+
+const OPERATION: &str = "fixture.operation";
+const ID_LOGIN: &str = "fixture.idLogin";
+
+fn spec() -> SearchSpec {
+    let pack = plugin::parse_and_compile(PACK, PackOrigin::Bundled, false)
+        .expect("fixture pack must compile");
+    SearchSpec::from_registry(&Registry {
+        packs: vec![Arc::new(pack)],
+        errors: Vec::new(),
+    })
+}
 
 const DAY: &str = "2026-07-14";
 
 /// Two matching lines among filler, plus a continuation line that carries no
-/// timestamp of its own — the scan must date it by the entry that opened it.
+/// timestamp of its own - the scan must date it by the entry that opened it.
 fn log_text() -> String {
     let mut text = String::new();
     for minute in 0..200 {
@@ -30,17 +58,18 @@ fn service() -> ServiceConfig {
     ServiceConfig {
         id: "test/Svc".into(),
         name: "Svc".into(),
-        environment: Environment::Test,
-        kudu_url: None,
-        kudu_url_manual: false,
-        profile: None,
+        environment: "test".into(),
+        pack_id: "fixture".into(),
+        endpoint: None,
+        endpoint_manual: false,
+        location: None,
         source: ServiceSource::Manual,
     }
 }
 
 /// Writes the zstd file and the manifest entry a synced service would leave behind.
 fn build_cache(service: &ServiceConfig) -> u64 {
-    let dir = log_looker_lib::cache::service_dir(service.environment, &service.name).unwrap();
+    let dir = log_looker_lib::cache::service_dir(&service.environment, &service.name).unwrap();
     let text = log_text();
     let local_name = format!("log-{DAY}.log.zst");
     std::fs::write(
@@ -62,6 +91,7 @@ fn build_cache(service: &ServiceConfig) -> u64 {
                 last_ts: None,
             },
         )]),
+        ..Default::default()
     };
     std::fs::write(
         dir.join("manifest.json"),
@@ -76,38 +106,79 @@ fn search_for(query: &str, cache: &MemCache, service: &ServiceConfig) -> SearchR
         service_ids: vec![service.id.clone()],
         date_from: DAY.parse().unwrap(),
         date_to: DAY.parse().unwrap(),
+        time_from: None,
+        time_to: None,
         query: query.into(),
         is_regex: false,
         case_sensitive: false,
         context_lines: 2,
     };
-    search::run(&request, std::slice::from_ref(service), cache, |_| {}).expect("search failed")
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    search::run(
+        &request,
+        std::slice::from_ref(service),
+        &spec(),
+        cache,
+        &cancel,
+        usize::MAX,
+        |_| {},
+    )
+    .expect("search failed")
 }
 
-/// The hits a search must produce, whatever tier served the file.
-fn assert_expected(result: &SearchResult) {
+/// The hits a search must produce, whatever tier served the file. The stored
+/// hits are compact; the line text and context are hydrated back the way the
+/// UI's paging does it.
+fn assert_expected(result: &SearchResult, cache: &MemCache) {
     assert_eq!(result.files_scanned, 1);
     assert_eq!(result.lines_scanned, 203);
     assert_eq!(result.hits.len(), 1, "one 'Handling' line");
+    assert!(!result.truncated);
 
     let hit = &result.hits[0];
     assert_eq!(hit.line_number, 201);
+
+    // The pack's fields, read back out of the result's columns by their keys
+    let column = |key: &str| {
+        result
+            .field_meta
+            .iter()
+            .position(|meta| meta.key == key)
+            .unwrap_or_else(|| panic!("no column {key}"))
+    };
     assert_eq!(
-        hit.fields.operation.as_deref(),
+        result.columns.display(column(OPERATION), hit.row).as_deref(),
         Some("UpdateReadDetailPostCommand")
     );
     assert_eq!(
-        hit.fields.id_login.as_deref(),
-        Some("3306928e-aaaa-bbbb-cccc-ddddeeeeffff")
+        result.columns.display(column(ID_LOGIN), hit.row).as_deref(),
+        Some("3306928e-aaaa-bbbb-cccc-ddddeeeeffff"),
+        "a mixed-case GUID is stored lowercased"
     );
     assert_eq!(
         hit.timestamp.map(|ts| ts.to_string()),
         Some("2026-07-14 09:30:00.200".to_string())
     );
-    // Context is collected across the tiers the same way
-    assert_eq!(hit.context_before.len(), 2);
-    assert_eq!(hit.context_after.len(), 2);
-    assert!(hit.context_after[0].starts_with("    at Example.Api.Handler.Handle()"));
+
+    // Text and context are fetched back from the file the same across tiers
+    let mut fetched = None;
+    search::fetch_hit_lines(
+        &result.files,
+        &[(hit.file, hit.line_number, 0)],
+        2,
+        cache,
+        |_, line| fetched = Some(line),
+    )
+    .expect("hydration failed");
+    let fetched = fetched.expect("the hit line must be fetched");
+    assert!(fetched.line.contains("Handling UpdateReadDetailPostCommand"));
+    assert!(
+        fetched.line.contains("    at Example.Api.Handler.Handle()"),
+        "the continuation line belongs to the entry text"
+    );
+    assert_eq!(fetched.context_before.len(), 2);
+    assert_eq!(fetched.context_after.len(), 1, "the after-context starts at the next entry");
+    assert!(fetched.context_after[0].contains("Boom: NullReferenceException"));
 }
 
 #[test]
@@ -119,19 +190,19 @@ fn a_search_returns_the_same_hits_from_disk_from_ram_and_when_the_budget_runs_ou
     let service = service();
     let text_bytes = build_cache(&service);
 
-    // Cache off — the file is read from disk and nothing is held
+    // Cache off - the file is read from disk and nothing is held
     let off = MemCache::new(false, 2048);
-    assert_expected(&search_for("Handling", &off, &service));
+    assert_expected(&search_for("Handling", &off, &service), &off);
     assert_eq!(off.stats().unwrap().files, 0);
 
-    // Cache on — the first search loads the text, the second reuses it
+    // Cache on - the first search loads the text, the second reuses it
     let on = MemCache::new(true, 2048);
-    assert_expected(&search_for("Handling", &on, &service));
+    assert_expected(&search_for("Handling", &on, &service), &on);
     let stats = on.stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.used_bytes, text_bytes, "the text is held decompressed");
 
-    assert_expected(&search_for("Handling", &on, &service));
+    assert_expected(&search_for("Handling", &on, &service), &on);
     assert_eq!(
         on.stats().unwrap().used_bytes,
         text_bytes,
@@ -143,7 +214,7 @@ fn a_search_returns_the_same_hits_from_disk_from_ram_and_when_the_budget_runs_ou
     // by memcache's own tests. The disabled cache above covers streaming here.
 
     // A re-synced (grown) file is not served from a stale RAM copy
-    let dir = log_looker_lib::cache::service_dir(service.environment, &service.name).unwrap();
+    let dir = log_looker_lib::cache::service_dir(&service.environment, &service.name).unwrap();
     let grown = format!("{}14.07.2026 09:32:00.400 INFO - Handling AgainCommand\n", log_text());
     std::fs::write(
         dir.join(format!("log-{DAY}.log.zst")),

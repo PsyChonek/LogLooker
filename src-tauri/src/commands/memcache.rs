@@ -32,6 +32,7 @@ pub fn set_memory_cache(
     log_state.info(
         "memcache",
         &match settings.enabled {
+            true if settings.max_mb == 0 => "enabled, no cap".to_string(),
             true => format!("enabled, cap {} MB", settings.max_mb),
             false => "disabled".to_string(),
         },

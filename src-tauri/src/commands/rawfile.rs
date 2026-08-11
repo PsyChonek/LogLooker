@@ -154,12 +154,37 @@ pub fn delete_cached_file(
     file: String,
 ) -> Result<(), String> {
     let service = find_service(&config_state, &service_id)?;
-    let dir = cache::service_dir_path(service.environment, &service.name)?;
+    let dir = cache::service_dir_path(&service.environment, &service.name)?;
     cache::delete_cached_file(&service, &file)?;
     // The RAM copy would otherwise sit there until something evicted it
     mem_cache.forget(&dir.join(format!("{file}.zst")))?;
     log_state.info("cache", &format!("deleted {file} of {}", service.name));
     Ok(())
+}
+
+/// Decompresses a cached file to a path the user picked (via a save dialog on the
+/// frontend) and returns the bytes written. Runs the decompression off the main
+/// thread so a large file does not block the UI.
+#[tauri::command]
+pub async fn export_cached_file(
+    config_state: tauri::State<'_, ConfigState>,
+    log_state: tauri::State<'_, LogState>,
+    service_id: String,
+    file: String,
+    target_path: String,
+) -> Result<u64, String> {
+    let service = find_service(&config_state, &service_id)?;
+    let bytes = {
+        let file = file.clone();
+        let target_path = target_path.clone();
+        tokio::task::spawn_blocking(move || {
+            cache::export_cached_file(&service, &file, std::path::Path::new(&target_path))
+        })
+        .await
+        .map_err(|e| format!("Export task failed: {e}"))??
+    };
+    log_state.info("cache", &format!("exported {file} to {target_path}"));
+    Ok(bytes)
 }
 
 /// Opens Windows Explorer with the cached file selected.
@@ -170,7 +195,7 @@ pub fn reveal_cached_file(
     file: String,
 ) -> Result<(), String> {
     let service = find_service(&config_state, &service_id)?;
-    let dir = cache::service_dir_path(service.environment, &service.name)?;
+    let dir = cache::service_dir_path(&service.environment, &service.name)?;
     let path = dir.join(format!("{file}.zst"));
     if !path.exists() {
         return Err(format!("{file} is not cached for {}", service.name));
@@ -188,7 +213,7 @@ pub fn open_cache_dir(
     let dir = match service_id {
         Some(id) => {
             let service = find_service(&config_state, &id)?;
-            cache::service_dir_path(service.environment, &service.name)?
+            cache::service_dir_path(&service.environment, &service.name)?
         }
         None => cache::cache_root()?,
     };
@@ -225,8 +250,11 @@ pub async fn open_raw_window(
         "caseSensitive": case_sensitive,
     });
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
-        .title(format!("{file} — {service_name} — LogLooker"))
+        .title(format!("{file} - {service_name} - LogLooker"))
         .inner_size(1100.0, 700.0)
+        // Tauri's native drag-drop handler swallows HTML5 drag events on Windows,
+        // which breaks the column drag-to-reorder in DataTable
+        .disable_drag_drop_handler()
         .additional_browser_args(crate::commands::WEBVIEW_BROWSER_ARGS)
         .initialization_script(format!("window.__RAW_VIEW__ = {params};"))
         .build()

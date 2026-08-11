@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import { formatBytes } from '@/stores/appStore';
-import { buildHighlighter, slotClass, type HighlightPart } from '@/utils/regexQuery';
+import { buildHighlighter, partClass, partStyle, type HighlightPart } from '@/utils/regexQuery';
+import RegexGuide from './RegexGuide.vue';
 import type { RawFileInfo, RawSearchResult } from '@/types';
 
 // Rows are a fixed height and never wrap, so the whole file can be virtualized:
@@ -13,6 +15,11 @@ const OVERSCAN = 20;
 // Lines of headroom kept above the target line when jumping to it
 const HEADROOM = 5;
 const SEARCH_DEBOUNCE_MS = 300;
+// Browsers clamp element heights (Chromium at ~33.5M px), so a multi-million
+// line file cannot get a spacer of totalLines * ROW_HEIGHT - scrolling past
+// the clamp renders nothing. The spacer is capped at this height and scroll
+// positions are mapped to lines proportionally instead.
+const MAX_VIRTUAL_HEIGHT = 16_000_000;
 
 // `line` is the matched line to jump to and highlight; omitted when the file is
 // opened from the Files view, where there is nothing to jump to.
@@ -43,13 +50,43 @@ const scrollTop = ref(0);
 const viewportHeight = ref(0);
 
 const totalLines = computed(() => info.value?.totalLines ?? 0);
-const gutterWidth = computed(() => `${String(totalLines.value).length + 1}ch`);
+// The gutter span carries px-2 (1rem) of horizontal padding, and with
+// border-box that padding eats into the width - so the digits themselves get
+// the character count and the 1rem is added back on top, or wide line numbers
+// (millions of lines) clip.
+const gutterWidth = computed(() => `calc(${String(totalLines.value).length + 1}ch + 1rem)`);
+
+const totalHeight = computed(() => totalLines.value * ROW_HEIGHT);
+const virtualHeight = computed(() => Math.min(totalHeight.value, MAX_VIRTUAL_HEIGHT));
+
+// Maps a scrollbar position to the pixel offset it represents in the full,
+// unclamped file. Identity for files that fit under the height cap; for larger
+// files the ends are pinned so the last line is reachable at max scroll.
+function contentY(scroll: number): number {
+  if (totalHeight.value <= MAX_VIRTUAL_HEIGHT) return scroll;
+  const maxScroll = Math.max(1, virtualHeight.value - viewportHeight.value);
+  return (scroll / maxScroll) * (totalHeight.value - viewportHeight.value);
+}
+
+function scrollForContentY(y: number): number {
+  if (totalHeight.value <= MAX_VIRTUAL_HEIGHT) return y;
+  const maxScroll = Math.max(1, virtualHeight.value - viewportHeight.value);
+  return (y / (totalHeight.value - viewportHeight.value)) * maxScroll;
+}
 
 const range = computed(() => {
-  const start = Math.max(0, Math.floor(scrollTop.value / ROW_HEIGHT) - OVERSCAN);
+  const top = Math.floor(contentY(scrollTop.value) / ROW_HEIGHT);
+  const start = Math.max(0, top - OVERSCAN);
   const count = Math.ceil(viewportHeight.value / ROW_HEIGHT) + OVERSCAN * 2;
   return { start, end: Math.min(totalLines.value, start + count) };
 });
+
+// Where to translate the rendered rows so line range.start lands at its mapped
+// position relative to the current scroll offset. Equals start * ROW_HEIGHT
+// when no compression is in effect.
+const rowsOffset = computed(
+  () => scrollTop.value - (contentY(scrollTop.value) - range.value.start * ROW_HEIGHT),
+);
 
 const rows = computed(() => {
   const visible = [];
@@ -89,7 +126,9 @@ function onScroll(event: Event) {
 
 function jumpToLine(line: number) {
   if (!viewport.value) return;
-  const top = Math.max(0, (line - 1 - HEADROOM) * ROW_HEIGHT);
+  const contentTop = Math.max(0, (line - 1 - HEADROOM) * ROW_HEIGHT);
+  const maxScroll = Math.max(0, virtualHeight.value - viewportHeight.value);
+  const top = Math.min(maxScroll, Math.max(0, scrollForContentY(contentTop)));
   viewport.value.scrollTop = top;
   scrollTop.value = top;
 }
@@ -102,14 +141,15 @@ function scrollToTargetLine() {
 
 const searchInput = ref<HTMLInputElement | null>(null);
 const query = ref(props.initialQuery ?? '');
-const isRegex = ref(props.initialIsRegex ?? false);
+const isRegex = ref(props.initialIsRegex ?? true);
 const caseSensitive = ref(props.initialCaseSensitive ?? false);
 const searching = ref(false);
 const searchError = ref<string | null>(null);
 const result = ref<RawSearchResult | null>(null);
 const current = ref(-1);
 const showMatches = ref(false);
-// The query the current result was produced with — inline highlighting must
+const showRegexGuide = ref(false);
+// The query the current result was produced with - inline highlighting must
 // track it, not the input, which may already be ahead of the debounce
 const executed = ref<{ query: string; isRegex: boolean; caseSensitive: boolean } | null>(null);
 
@@ -182,7 +222,7 @@ function gotoMatch(index: number) {
 
 // Splits lines into plain and matched segments, coloured per capture group so
 // hits keep the colours of the search that opened the viewer. Falls back to no
-// highlighting when the query uses syntax JS regex lacks — the match list
+// highlighting when the query uses syntax JS regex lacks - the match list
 // still works then.
 const highlighter = computed(() => {
   const spec = executed.value;
@@ -228,6 +268,31 @@ function scrollMatchesToCurrent() {
 
 // --- Window / lifecycle ---
 
+// Decompress the open file and save it as a plain log file where the user picks
+async function exportFile() {
+  let path: string | null;
+  try {
+    path = await save({
+      defaultPath: props.file,
+      filters: [{ name: 'Log', extensions: ['log', 'txt'] }],
+    });
+  } catch (e) {
+    error.value = String(e);
+    return;
+  }
+  if (!path) return;
+  error.value = null;
+  try {
+    await invoke<number>('export_cached_file', {
+      serviceId: props.serviceId,
+      file: props.file,
+      targetPath: path,
+    });
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
 async function openInWindow() {
   try {
     await invoke('open_raw_window', {
@@ -246,6 +311,9 @@ async function openInWindow() {
 }
 
 function onKeydown(event: KeyboardEvent) {
+  // The regex guide is a modal on top; let it own the keyboard while open so
+  // Escape closes only the guide, not the viewer underneath
+  if (showRegexGuide.value) return;
   if (event.key === 'Escape') {
     if (document.activeElement === searchInput.value) {
       searchInput.value?.blur();
@@ -299,7 +367,7 @@ onUnmounted(() => {
   const handle = info.value?.handle;
   if (handle !== undefined) {
     invoke('close_raw_file', { handle }).catch(() => {
-      // Nothing to do — leftover temp files are swept on the next app start
+      // Nothing to do - leftover temp files are swept on the next app start
     });
   }
 });
@@ -347,15 +415,21 @@ onUnmounted(() => {
           Jump to line {{ line.toLocaleString() }}
         </button>
         <button
-          v-if="!windowed"
           class="ml-auto shrink-0 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+          title="Decompress and save this file to a location you choose"
+          @click="exportFile"
+        >
+          Export...
+        </button>
+        <button
+          v-if="!windowed"
+          class="shrink-0 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
           @click="openInWindow"
         >
           Open in window
         </button>
         <button
           class="shrink-0 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
-          :class="windowed ? 'ml-auto' : ''"
           @click="emit('close')"
         >
           Close (Esc)
@@ -398,6 +472,13 @@ onUnmounted(() => {
           @click="isRegex = !isRegex"
         >
           .*
+        </button>
+        <button
+          class="w-6 h-6 flex items-center justify-center rounded-full border border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-blue-400 dark:hover:border-blue-600"
+          title="Regex syntax guide and examples"
+          @click="showRegexGuide = true"
+        >
+          ?
         </button>
         <span
           class="w-28 text-gray-500 dark:text-gray-400 tabular-nums"
@@ -464,11 +545,11 @@ onUnmounted(() => {
       >
         <div
           class="relative w-max min-w-full"
-          :style="{ height: `${totalLines * ROW_HEIGHT}px` }"
+          :style="{ height: `${virtualHeight}px` }"
         >
           <div
             class="absolute top-0 left-0 w-max min-w-full"
-            :style="{ transform: `translateY(${range.start * ROW_HEIGHT}px)` }"
+            :style="{ transform: `translateY(${rowsOffset}px)` }"
           >
             <div
               v-for="row in rows"
@@ -502,7 +583,8 @@ onUnmounted(() => {
                   :key="i"
                 ><span
                   v-if="part.slot !== null"
-                  :class="slotClass(part.slot)"
+                  :class="partClass(part)"
+                  :style="partStyle(part)"
                 >{{ part.text }}</span><template v-else>{{ part.text }}</template></template>
               </span>
             </div>
@@ -519,7 +601,7 @@ onUnmounted(() => {
         >
           Matches
           <template v-if="result.matches.length < result.total">
-            — showing first {{ result.matches.length.toLocaleString() }} of
+            - showing first {{ result.matches.length.toLocaleString() }} of
             {{ result.total.toLocaleString() }}
           </template>
         </div>
@@ -572,7 +654,8 @@ onUnmounted(() => {
                     :key="i"
                   ><span
                     v-if="part.slot !== null"
-                    :class="slotClass(part.slot)"
+                    :class="partClass(part)"
+                    :style="partStyle(part)"
                   >{{ part.text }}</span><template v-else>{{ part.text }}</template></template>
                 </span>
               </div>
@@ -581,5 +664,10 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+
+    <RegexGuide
+      v-if="showRegexGuide"
+      @close="showRegexGuide = false"
+    />
   </div>
 </template>

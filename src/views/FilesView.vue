@@ -1,16 +1,30 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import BaseCheckbox from '@/components/BaseCheckbox.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
+import DataTable, { type DataTableColumn, type SortState } from '@/components/DataTable.vue';
 import RawFileViewer from '@/components/RawFileViewer.vue';
 import { formatBytes, useAppStore } from '@/stores/appStore';
+import { sortRows, type SortAccessor } from '@/utils/tableSort';
 import type { CachedFileInfo } from '@/types';
+
+const columns: DataTableColumn[] = [
+  { key: 'service', label: 'Service', width: 128, sortable: true },
+  { key: 'file', label: 'File', sortable: true },
+  { key: 'date', label: 'Date', width: 112, sortable: true, numeric: true },
+  { key: 'instance', label: 'Instance', width: 160, sortable: true },
+  { key: 'size', label: 'Size', width: 112, align: 'right', sortable: true, numeric: true },
+  { key: 'cached', label: 'Cached', width: 96, align: 'right', sortable: true, numeric: true },
+  { key: 'actions', label: '', width: 232, align: 'right', reorderable: false, hideable: false },
+];
 
 const store = useAppStore();
 const files = ref<CachedFileInfo[]>([]);
 const loading = ref(false);
 const error = ref<string | null>(null);
+const notice = ref<string | null>(null);
 const filter = ref('');
 const selectedOnly = ref(false);
 const opened = ref<CachedFileInfo | null>(null);
@@ -39,6 +53,20 @@ const visibleFiles = computed(() => {
 const totalBytes = computed(() =>
   visibleFiles.value.reduce((sum, file) => sum + file.sizeBytes, 0),
 );
+
+const sort = ref<SortState | null>(null);
+
+// Sort on raw values, not the formatted strings shown in the cells
+const sortAccessors: Record<string, SortAccessor<CachedFileInfo>> = {
+  service: (file) => serviceNames.value[file.serviceId] ?? file.serviceId,
+  file: (file) => file.file,
+  date: (file) => file.date,
+  instance: (file) => file.instance,
+  size: (file) => file.sizeBytes,
+  cached: (file) => file.compressedBytes,
+};
+
+const sortedFiles = computed(() => sortRows(visibleFiles.value, sort.value, sortAccessors));
 
 async function load() {
   loading.value = true;
@@ -69,6 +97,32 @@ async function revealFile(file: CachedFileInfo) {
   }
 }
 
+// Decompress the cached .zst and save it as a plain log file where the user picks
+async function exportFile(file: CachedFileInfo) {
+  let path: string | null;
+  try {
+    path = await save({
+      defaultPath: file.file,
+      filters: [{ name: 'Log', extensions: ['log', 'txt'] }],
+    });
+  } catch (e) {
+    error.value = String(e);
+    return;
+  }
+  if (!path) return;
+  error.value = null;
+  try {
+    const bytes = await invoke<number>('export_cached_file', {
+      serviceId: file.serviceId,
+      file: file.file,
+      targetPath: path,
+    });
+    notice.value = `Exported ${formatBytes(bytes)} to ${path}`;
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
 async function openInWindow(file: CachedFileInfo) {
   try {
     await invoke('open_raw_window', {
@@ -76,6 +130,9 @@ async function openInWindow(file: CachedFileInfo) {
       serviceName: serviceNames.value[file.serviceId] ?? file.serviceId,
       file: file.file,
       line: null,
+      query: null,
+      isRegex: true,
+      caseSensitive: false,
     });
   } catch (e) {
     error.value = String(e);
@@ -109,6 +166,19 @@ onMounted(load);
       <button
         class="ml-4 shrink-0 hover:underline"
         @click="error = null"
+      >
+        Dismiss
+      </button>
+    </div>
+
+    <div
+      v-if="notice"
+      class="mb-4 px-4 py-2 rounded-md bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 text-sm text-green-700 dark:text-green-400 flex items-center justify-between"
+    >
+      <span class="break-all">{{ notice }}</span>
+      <button
+        class="ml-4 shrink-0 hover:underline"
+        @click="notice = null"
       >
         Dismiss
       </button>
@@ -156,101 +226,81 @@ onMounted(load);
     <div
       class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden"
     >
-      <div class="max-h-[calc(100vh-220px)] overflow-auto">
-        <table class="w-full min-w-[56rem] text-xs font-mono">
-          <thead class="sticky top-0 bg-white dark:bg-gray-800">
-            <tr class="border-b border-gray-200 dark:border-gray-700">
-              <th class="text-left py-2 px-3 font-medium text-gray-500 dark:text-gray-400 w-32">
-                Service
-              </th>
-              <th class="text-left py-2 px-3 font-medium text-gray-500 dark:text-gray-400">
-                File
-              </th>
-              <th class="text-left py-2 px-3 font-medium text-gray-500 dark:text-gray-400 w-28">
-                Date
-              </th>
-              <th class="text-left py-2 px-3 font-medium text-gray-500 dark:text-gray-400 w-40">
-                Instance
-              </th>
-              <th class="text-right py-2 px-3 font-medium text-gray-500 dark:text-gray-400 w-28">
-                Size
-              </th>
-              <th class="text-right py-2 px-3 font-medium text-gray-500 dark:text-gray-400 w-24">
-                Cached
-              </th>
-              <th class="w-44 py-2 px-3" />
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="file in visibleFiles"
-              :key="`${file.serviceId}:${file.file}`"
-              class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer"
-              title="Open the raw file"
-              @click="opened = file"
+      <DataTable
+        v-model:sort="sort"
+        table-id="files"
+        :columns="columns"
+        :rows="sortedFiles"
+        :row-key="(file) => `${file.serviceId}:${file.file}`"
+        table-class="min-w-[56rem] font-mono"
+        scroll-class="max-h-[calc(100vh-220px)]"
+        :loading="loading"
+        clickable-rows
+        @row-click="(file) => (opened = file)"
+      >
+        <template #service="{ row }">
+          <span
+            class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded"
+            :class="
+              row.serviceId.startsWith('production/')
+                ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+                : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
+            "
+          >
+            {{ serviceNames[row.serviceId] ?? row.serviceId }}
+          </span>
+        </template>
+        <template #file="{ row }">
+          <span class="text-gray-700 dark:text-gray-300 break-all">{{ row.file }}</span>
+        </template>
+        <template #date="{ row }">
+          <span class="text-gray-500 dark:text-gray-400 whitespace-nowrap">{{ row.date ?? '-' }}</span>
+        </template>
+        <template #instance="{ row }">
+          <span class="block text-gray-400 truncate">{{ row.instance ?? '-' }}</span>
+        </template>
+        <template #size="{ row }">
+          <span class="text-gray-500 dark:text-gray-400 whitespace-nowrap">{{ formatBytes(row.sizeBytes) }}</span>
+        </template>
+        <template #cached="{ row }">
+          <span class="text-gray-400 whitespace-nowrap">{{ formatBytes(row.compressedBytes) }}</span>
+        </template>
+        <template #actions="{ row }">
+          <span class="whitespace-nowrap">
+            <button
+              class="px-1.5 py-0.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:underline"
+              title="Open the raw file in its own window"
+              @click.stop="openInWindow(row)"
             >
-              <td class="py-1.5 px-3">
-                <span
-                  class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded"
-                  :class="
-                    file.serviceId.startsWith('production/')
-                      ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
-                      : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
-                  "
-                >
-                  {{ serviceNames[file.serviceId] ?? file.serviceId }}
-                </span>
-              </td>
-              <td class="py-1.5 px-3 text-gray-700 dark:text-gray-300 break-all">
-                {{ file.file }}
-              </td>
-              <td class="py-1.5 px-3 text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                {{ file.date ?? '—' }}
-              </td>
-              <td class="py-1.5 px-3 text-gray-400 truncate">
-                {{ file.instance ?? '—' }}
-              </td>
-              <td class="py-1.5 px-3 text-right text-gray-500 dark:text-gray-400 whitespace-nowrap">
-                {{ formatBytes(file.sizeBytes) }}
-              </td>
-              <td class="py-1.5 px-3 text-right text-gray-400 whitespace-nowrap">
-                {{ formatBytes(file.compressedBytes) }}
-              </td>
-              <td class="py-1.5 px-3 text-right whitespace-nowrap">
-                <button
-                  class="px-1.5 py-0.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:underline"
-                  title="Open the raw file in its own window"
-                  @click.stop="openInWindow(file)"
-                >
-                  Window
-                </button>
-                <button
-                  class="px-1.5 py-0.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:underline"
-                  title="Show the cached file in Explorer"
-                  @click.stop="revealFile(file)"
-                >
-                  Reveal
-                </button>
-                <button
-                  class="px-1.5 py-0.5 text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:underline"
-                  title="Delete the cached file"
-                  @click.stop="toDelete = file"
-                >
-                  Delete
-                </button>
-              </td>
-            </tr>
-            <tr v-if="!loading && visibleFiles.length === 0">
-              <td
-                colspan="7"
-                class="py-8 text-center text-gray-400"
-              >
-                No cached files. Select services and a date range on the Services page and sync.
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+              Window
+            </button>
+            <button
+              class="px-1.5 py-0.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:underline"
+              title="Decompress and save the file to a location you choose"
+              @click.stop="exportFile(row)"
+            >
+              Export
+            </button>
+            <button
+              class="px-1.5 py-0.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:underline"
+              title="Show the cached file in Explorer"
+              @click.stop="revealFile(row)"
+            >
+              Reveal
+            </button>
+            <button
+              class="px-1.5 py-0.5 text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:underline"
+              title="Delete the cached file"
+              @click.stop="toDelete = row"
+            >
+              Delete
+            </button>
+          </span>
+        </template>
+        <template #empty>
+          No cached files. Select services and a date range on the Services page and sync.
+        </template>
+      </DataTable>
     </div>
 
     <RawFileViewer

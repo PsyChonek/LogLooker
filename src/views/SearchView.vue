@@ -2,24 +2,143 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { save } from '@tauri-apps/plugin-dialog';
 import BaseCheckbox from '@/components/BaseCheckbox.vue';
+import BaseSelect, { type SelectOption } from '@/components/BaseSelect.vue';
+import DataTable, { type DataTableColumn, type SortState } from '@/components/DataTable.vue';
+import DateTimePicker from '@/components/DateTimePicker.vue';
 import QueryBuilder from '@/components/QueryBuilder.vue';
 import RawFileViewer from '@/components/RawFileViewer.vue';
+import RegexGuide from '@/components/RegexGuide.vue';
 import SearchChart from '@/components/SearchChart.vue';
 import Spinner from '@/components/Spinner.vue';
-import { formatLogTime } from '@/composables/useTimeMode';
+import {
+  convertPickerTime,
+  formatLogTime,
+  pickerTimeToUtc,
+  useTimeMode,
+} from '@/composables/useTimeMode';
 import { useAppStore } from '@/stores/appStore';
-import { buildHighlighter, slotClass, type HighlightPart } from '@/utils/regexQuery';
-import type { SavedQuery, SearchHit, SearchMeta, SearchProgress } from '@/types';
+import {
+  buildExtractorParts,
+  buildHighlighter,
+  partClass,
+  partStyle,
+  type HighlightPart,
+} from '@/utils/regexQuery';
+import type {
+  ExportRequest,
+  ExportResult,
+  SavedQuery,
+  SearchHit,
+  SearchMeta,
+  SearchProgress,
+} from '@/types';
 
 const PAGE_SIZE = 500;
+// A preview scans with a tiny hit cap: enough rows to judge the query, cheap
+// enough to iterate on. The full search is one click away from the banner.
+const PREVIEW_LIMIT = 100;
+// The clipboard is not meant to carry a whole result; a file is. Past this the
+// copy is cut and the UI reports by how much. A file export is never capped.
+const CLIPBOARD_MAX_LINES = 50000;
 
 const store = useAppStore();
-const query = ref('');
-const isRegex = ref(false);
-const caseSensitive = ref(false);
+const { mode: timeMode } = useTimeMode();
+
+// Remembers the last filter (text plus its regex/case flags) across restarts,
+// so the search view reopens on whatever the user last typed.
+const FILTER_KEY = 'loglooker.searchFilter';
+
+interface PersistedFilter {
+  query?: string;
+  isRegex?: boolean;
+  caseSensitive?: boolean;
+  timeEnabled?: boolean;
+  timeFrom?: string;
+  timeTo?: string;
+}
+
+function loadFilter(): PersistedFilter {
+  try {
+    return JSON.parse(localStorage.getItem(FILTER_KEY) ?? '{}') as PersistedFilter;
+  } catch {
+    return {};
+  }
+}
+
+const savedFilter = loadFilter();
+const query = ref(savedFilter.query ?? '');
+const isRegex = ref(savedFilter.isRegex ?? true);
+const caseSensitive = ref(savedFilter.caseSensitive ?? false);
 const contextLines = ref(2);
+const CONTEXT_OPTIONS: SelectOption<number>[] = [0, 2, 5, 10].map((n) => ({
+  value: n,
+  label: String(n),
+}));
+
+// Optional time window refining the day range. Values stay as wall-clock
+// minutes in the currently displayed UTC/local mode while they are edited.
+const timeEnabled = ref(savedFilter.timeEnabled ?? false);
+const timeFrom = ref(savedFilter.timeFrom ?? '');
+const timeTo = ref(savedFilter.timeTo ?? '');
+
+// First enable seeds the window with the whole selected day range, so the
+// inputs never open on an empty value the backend could not parse.
+watch(timeEnabled, (on) => {
+  if (!on) return;
+  if (!timeFrom.value) timeFrom.value = `${store.dateFrom}T00:00`;
+  if (!timeTo.value) timeTo.value = `${store.dateTo}T23:59`;
+});
+
+function wallTimeWindow(): { from: string; to: string } {
+  const rangeFrom = `${store.dateFrom}T00:00`;
+  const rangeTo = `${store.dateTo}T23:59`;
+  return {
+    from: timeFrom.value && timeFrom.value > rangeFrom ? timeFrom.value : rangeFrom,
+    to: timeTo.value && timeTo.value < rangeTo ? timeTo.value : rangeTo,
+  };
+}
+
+const timeWindowInvalid = computed(() => {
+  if (!timeEnabled.value) return false;
+  const window = wallTimeWindow();
+  return window.from > window.to;
+});
+
+// The backend receives UTC boundaries (NaiveDateTime needs seconds). The "to"
+// minute is padded to its last nanosecond so an entry logged anywhere inside it
+// still falls in range. A cleared picker falls back to that end of the selected
+// day range.
+function timeWindow(): { from: string | null; to: string | null } {
+  if (!timeEnabled.value) return { from: null, to: null };
+  const window = wallTimeWindow();
+  return {
+    from: pickerTimeToUtc(window.from),
+    to: pickerTimeToUtc(window.to, true),
+  };
+}
+
+watch(timeMode, (next, previous) => {
+  timeFrom.value = convertPickerTime(timeFrom.value, previous, next);
+  timeTo.value = convertPickerTime(timeTo.value, previous, next);
+});
+
+watch([query, isRegex, caseSensitive, timeEnabled, timeFrom, timeTo], () => {
+  localStorage.setItem(
+    FILTER_KEY,
+    JSON.stringify({
+      query: query.value,
+      isRegex: isRegex.value,
+      caseSensitive: caseSensitive.value,
+      timeEnabled: timeEnabled.value,
+      timeFrom: timeFrom.value,
+      timeTo: timeTo.value,
+    }),
+  );
+});
 const searching = ref(false);
+const cancelRequested = ref(false);
 const progress = ref<SearchProgress | null>(null);
 const loadingMore = ref(false);
 const error = ref<string | null>(null);
@@ -39,6 +158,19 @@ const times = computed(() =>
 );
 
 const allQueries = computed(() => [...presets.value, ...store.config.savedQueries]);
+
+// An action menu rather than a setting: it applies a query and drops straight
+// back to its own label, so it always rests on the value no option carries.
+const savedPick = ref('');
+const savedQueryOptions = computed<SelectOption<string>[]>(() =>
+  allQueries.value.map((saved, i) => ({ value: String(i), label: saved.name })),
+);
+
+function pickSavedQuery(index: string) {
+  savedPick.value = '';
+  const saved = allQueries.value[Number(index)];
+  if (saved) applyQuery(saved);
+}
 
 function applyQuery(saved: SavedQuery) {
   // The builder owns the query field while open; a saved query is a plain one
@@ -63,10 +195,16 @@ function onCompiled(compiled: string) {
   isRegex.value = true;
 }
 
-async function saveCurrentQuery() {
-  const name = prompt('Name for this query:', query.value.slice(0, 40));
-  if (!name) return;
-  store.config.savedQueries.push({ name, query: query.value, isRegex: isRegex.value });
+// Store the current query under `name`, overwriting an existing saved query of
+// the same name rather than adding a duplicate, then persist.
+async function persistSavedQuery(name: string) {
+  const entry = { name, query: query.value, isRegex: isRegex.value };
+  const existing = store.config.savedQueries.findIndex((q) => q.name === name);
+  if (existing === -1) {
+    store.config.savedQueries.push(entry);
+  } else {
+    store.config.savedQueries[existing] = entry;
+  }
   try {
     await store.saveConfig();
   } catch (e) {
@@ -74,40 +212,170 @@ async function saveCurrentQuery() {
   }
 }
 
-async function search() {
+async function saveCurrentQuery() {
+  const name = prompt('Name for this query:', query.value.slice(0, 40));
+  if (!name) return;
+  await persistSavedQuery(name);
+}
+
+// Save As opens a modal: type a fresh name, or click an existing saved query to
+// overwrite it. The modal never silently clobbers - a name that matches an
+// existing query is flagged as an overwrite before the user commits.
+const showSaveAs = ref(false);
+const saveAsName = ref('');
+
+function openSaveAs() {
+  saveAsName.value = '';
+  showSaveAs.value = true;
+}
+
+// True when the typed name matches an existing saved query, so the modal can
+// warn that saving will replace it rather than add a new one.
+const saveAsClashes = computed(() =>
+  store.config.savedQueries.some((q) => q.name === saveAsName.value.trim()),
+);
+
+async function confirmSaveAs() {
+  const name = saveAsName.value.trim();
+  if (!name) return;
+  await persistSavedQuery(name);
+  showSaveAs.value = false;
+}
+
+// Presets are backend built-ins and stay read-only; only the user's own saved
+// queries can be renamed or removed.
+const showManageQueries = ref(false);
+
+async function renameSavedQuery(saved: SavedQuery) {
+  const name = prompt('Rename query:', saved.name);
+  if (name === null) return;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed === saved.name) return;
+  saved.name = trimmed;
+  try {
+    await store.saveConfig();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+async function removeSavedQuery(saved: SavedQuery) {
+  if (!confirm(`Remove saved query "${saved.name}"?`)) return;
+  const i = store.config.savedQueries.indexOf(saved);
+  if (i === -1) return;
+  store.config.savedQueries.splice(i, 1);
+  if (store.config.savedQueries.length === 0) showManageQueries.value = false;
+  try {
+    await store.saveConfig();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+async function search(preview = false) {
   if (store.selectedServices.length === 0 || searching.value) return;
+  if (timeWindowInvalid.value) {
+    error.value = 'Time filter: "from" is after "to".';
+    return;
+  }
+  const window = timeWindow();
+  await runSearch(query.value, isRegex.value, caseSensitive.value, window.from, window.to, preview);
+}
+
+// The banner's "Run full search" repeats the previewed query, not the input box -
+// the user may already be typing the next refinement there
+async function continueFullSearch() {
+  if (searching.value) return;
+  await runSearch(
+    searchedQuery.value,
+    searchedIsRegex.value,
+    searchedCaseSensitive.value,
+    searchedTimeFrom.value,
+    searchedTimeTo.value,
+    false,
+  );
+}
+
+// The stale-range banner refreshes the current result against the now-changed
+// date range. It repeats the query these results came from (same reasoning as
+// continueFullSearch), keeping the preview/full mode they were run in.
+async function rerunForDateRange() {
+  if (searching.value) return;
+  await runSearch(
+    searchedQuery.value,
+    searchedIsRegex.value,
+    searchedCaseSensitive.value,
+    searchedTimeFrom.value,
+    searchedTimeTo.value,
+    searchedPreview.value,
+  );
+}
+
+async function runSearch(
+  submittedQuery: string,
+  submittedIsRegex: boolean,
+  submittedCaseSensitive: boolean,
+  submittedTimeFrom: string | null,
+  submittedTimeTo: string | null,
+  preview: boolean,
+) {
   searching.value = true;
+  cancelRequested.value = false;
   progress.value = null;
   error.value = null;
+  exportMsg.value = null;
   // The previous result stays on screen (blurred) until the new one arrives
-  const submittedQuery = query.value;
-  const submittedIsRegex = isRegex.value;
-  const submittedCaseSensitive = caseSensitive.value;
   try {
     const result = await invoke<SearchMeta>('search_logs', {
       request: {
         serviceIds: store.selectedServices.map((s) => s.id),
         dateFrom: store.dateFrom,
         dateTo: store.dateTo,
+        timeFrom: submittedTimeFrom,
+        timeTo: submittedTimeTo,
         query: submittedQuery,
         isRegex: submittedIsRegex,
         caseSensitive: submittedCaseSensitive,
         contextLines: contextLines.value,
       },
+      previewLimit: preview ? PREVIEW_LIMIT : null,
     });
     meta.value = result;
     hits.value = [];
     expanded.value = new Set();
-    sortField.value = 'time';
-    sortAsc.value = true;
+    sort.value = { key: 'time', ascending: false };
     searchedQuery.value = submittedQuery;
     searchedIsRegex.value = submittedIsRegex;
     searchedCaseSensitive.value = submittedCaseSensitive;
+    searchedTimeFrom.value = submittedTimeFrom;
+    searchedTimeTo.value = submittedTimeTo;
+    searchedPreview.value = preview;
+    searchedDateFrom.value = store.dateFrom;
+    searchedDateTo.value = store.dateTo;
     await loadMore();
   } catch (e) {
-    error.value = String(e);
+    if (String(e) === 'Search cancelled') {
+      // The backend freed the previous result when this search started, so
+      // there is nothing left to page through - back to the empty state
+      meta.value = null;
+      hits.value = [];
+      expanded.value = new Set();
+    } else {
+      error.value = String(e);
+    }
   } finally {
     searching.value = false;
+    cancelRequested.value = false;
+  }
+}
+
+async function cancelSearch() {
+  if (!searching.value || cancelRequested.value) return;
+  cancelRequested.value = true;
+  try {
+    await invoke('cancel_search');
+  } catch (e) {
+    error.value = String(e);
   }
 }
 
@@ -137,92 +405,87 @@ function onResultsScroll(event: Event) {
   }
 }
 
-type SortField = 'time' | 'service' | 'operation' | 'file';
+// The backend sorts by 'time', 'service', 'file', or any result column key
+type SortField = string;
 
-interface ColumnDef {
-  key: 'time' | 'service' | 'fields' | 'line';
-  label: string;
-  sortField: SortField;
-  width: string;
+// Column key -> backend sort field. The line column sorts by its file rather
+// than by its own content; a field column sorts by itself.
+const SORT_FIELDS: Record<string, SortField> = {
+  time: 'time',
+  service: 'service',
+  line: 'file',
+};
+
+/** The backend sort field a column header stands for. */
+function sortFieldOf(key: string): SortField {
+  return SORT_FIELDS[key] ?? key;
 }
 
-const ALL_COLUMNS: ColumnDef[] = [
-  { key: 'time', label: 'Time', sortField: 'time', width: 'w-40' },
-  { key: 'service', label: 'Service', sortField: 'service', width: 'w-28' },
-  { key: 'fields', label: 'Operation / Login', sortField: 'operation', width: 'w-44' },
-  { key: 'line', label: 'Line', sortField: 'file', width: '' },
+const baseColumns: DataTableColumn[] = [
+  {
+    key: 'time',
+    label: 'Time',
+    width: 248,
+    fitContent: true,
+    sortable: true,
+    numeric: true,
+    cellClass: 'text-gray-500 dark:text-gray-400 whitespace-nowrap',
+  },
+  { key: 'service', label: 'Service', width: 150, sortable: true },
+  {
+    key: 'line',
+    label: 'Line',
+    sortable: true,
+    cellClass: 'text-gray-700 dark:text-gray-300 break-all',
+  },
 ];
 
-const COLUMNS_STORAGE_KEY = 'loglooker.searchColumns';
+// One column per field the result carries, between Service and Line. The set
+// comes from the result itself (SearchMeta.fields), so a plugin's fields appear
+// as columns without the app knowing any of them by name.
+const columns = computed<DataTableColumn[]>(() => {
+  const fields = meta.value?.fields ?? [];
+  if (fields.length === 0) return baseColumns;
+  const extra: DataTableColumn[] = fields.map((field) => ({
+    key: field.key,
+    label: field.label,
+    width: 170,
+    sortable: true,
+    numeric: field.type === 'number',
+    cellClass: 'text-gray-500 dark:text-gray-400',
+  }));
+  const at = baseColumns.findIndex((column) => column.key === 'line');
+  const before = at === -1 ? baseColumns : baseColumns.slice(0, at);
+  const after = at === -1 ? [] : baseColumns.slice(at);
+  return [...before, ...extra, ...after];
+});
 
-function loadColumnPrefs(): { order: string[]; hidden: string[] } {
-  try {
-    const saved = JSON.parse(localStorage.getItem(COLUMNS_STORAGE_KEY) ?? '');
-    if (Array.isArray(saved.order) && Array.isArray(saved.hidden)) {
-      const valid = ALL_COLUMNS.map((c) => c.key as string);
-      const order = saved.order.filter((k: string) => valid.includes(k));
-      valid.forEach((k) => {
-        if (!order.includes(k)) order.push(k);
-      });
-      return { order, hidden: saved.hidden.filter((k: string) => valid.includes(k)) };
+// One-time migration: the hand-rolled search table stored its layout under its
+// own key; the shared DataTable now owns it under the common prefix. The saved
+// shape ({order, hidden, widths}, same column keys) is identical.
+const LEGACY_COLUMNS_KEY = 'loglooker.searchColumns';
+try {
+  const legacy = localStorage.getItem(LEGACY_COLUMNS_KEY);
+  if (legacy) {
+    if (!localStorage.getItem('loglooker.table.search')) {
+      localStorage.setItem('loglooker.table.search', legacy);
     }
-  } catch {
-    // fall through to defaults
+    localStorage.removeItem(LEGACY_COLUMNS_KEY);
   }
-  return { order: ALL_COLUMNS.map((c) => c.key), hidden: [] };
+} catch {
+  // ignore storage failures
 }
 
-const columnPrefs = ref(loadColumnPrefs());
-const showColumnMenu = ref(false);
-const dragKey = ref<string | null>(null);
+// Sorting is server-side: the header UI proposes the next state, and it is
+// applied only once the backend has re-sorted the result
+const sort = ref<SortState>({ key: 'time', ascending: false });
 
-function saveColumnPrefs() {
-  localStorage.setItem(COLUMNS_STORAGE_KEY, JSON.stringify(columnPrefs.value));
-}
-
-const visibleColumns = computed(() =>
-  columnPrefs.value.order
-    .filter((key) => !columnPrefs.value.hidden.includes(key))
-    .map((key) => ALL_COLUMNS.find((c) => c.key === key))
-    .filter((c): c is ColumnDef => !!c),
-);
-
-function toggleColumn(key: string) {
-  const hidden = columnPrefs.value.hidden;
-  const index = hidden.indexOf(key);
-  if (index >= 0) {
-    hidden.splice(index, 1);
-  } else if (visibleColumns.value.length > 1) {
-    hidden.push(key);
-  }
-  saveColumnPrefs();
-}
-
-function onColumnDrop(targetKey: string) {
-  if (!dragKey.value || dragKey.value === targetKey) return;
-  const order = columnPrefs.value.order;
-  const from = order.indexOf(dragKey.value);
-  const to = order.indexOf(targetKey);
-  if (from < 0 || to < 0) return;
-  order.splice(to, 0, ...order.splice(from, 1));
-  dragKey.value = null;
-  saveColumnPrefs();
-}
-
-const sortField = ref<SortField>('time');
-const sortAsc = ref(true);
-
-async function sortBy(column: ColumnDef) {
+async function onSort(next: SortState) {
   if (!meta.value || searching.value) return;
-  if (sortField.value === column.sortField) {
-    sortAsc.value = !sortAsc.value;
-  } else {
-    sortField.value = column.sortField;
-    sortAsc.value = true;
-  }
   error.value = null;
+  sort.value = next;
   try {
-    await invoke('sort_search_hits', { field: sortField.value, ascending: sortAsc.value });
+    await invoke('sort_search_hits', { field: sortFieldOf(next.key), ascending: next.ascending });
     expanded.value = new Set();
     hits.value = [];
     await loadMore();
@@ -241,19 +504,66 @@ function toggleExpanded(index: number) {
 }
 
 const rawView = ref<SearchHit | null>(null);
+const showRegexGuide = ref(false);
 // The table is the chart's accessible twin: every charted value is readable here
 const tab = ref<'table' | 'chart'>('table');
-// The query the current result came from — the chart labels itself with it, and
+// The query the current result came from - the chart labels itself with it, and
 // it must not follow the input box while the user types the next search.
 // The flags travel with it into the raw viewer, which pre-applies the search.
 const searchedQuery = ref('');
 const searchedIsRegex = ref(false);
 const searchedCaseSensitive = ref(false);
+// The time window the current result was searched with, so the rerun banners
+// repeat it rather than pick up edits made to the inputs since.
+const searchedTimeFrom = ref<string | null>(null);
+const searchedTimeTo = ref<string | null>(null);
+// The current result came from a preview (tiny hit cap) - the banner offers to
+// run it in full, and the config-cap warning must not fire for it
+const searchedPreview = ref(false);
+// The date range the current result was searched over. The filter line always
+// shows the live store range, so if the user changes it on the Services page
+// and comes back without re-searching, these results silently belong to the old
+// range - dateRangeStale drives a warning to re-run.
+const searchedDateFrom = ref('');
+const searchedDateTo = ref('');
+
+const dateRangeStale = computed(
+  () =>
+    meta.value !== null &&
+    (searchedDateFrom.value !== store.dateFrom || searchedDateTo.value !== store.dateTo),
+);
 
 // --- Inline highlighting, coloured per capture group (slots shared with charts) ---
 
+// Groups the user switched off in the legend: neither highlighted inline nor
+// carried into the extracted value (preview, Copy and Export alike). Keyed by
+// group name; pruned to the current result's groups whenever a search returns.
+const disabledGroups = ref<Set<string>>(new Set());
+
+function toggleGroup(name: string) {
+  const next = new Set(disabledGroups.value);
+  if (next.has(name)) next.delete(name);
+  else next.add(name);
+  disabledGroups.value = next;
+}
+
+watch(
+  () => meta.value?.groupNames,
+  (names) => {
+    if (!names) return;
+    const live = new Set(names);
+    const pruned = new Set([...disabledGroups.value].filter((g) => live.has(g)));
+    if (pruned.size !== disabledGroups.value.size) disabledGroups.value = pruned;
+  },
+);
+
 const highlighter = computed(() =>
-  buildHighlighter(searchedQuery.value, searchedIsRegex.value, searchedCaseSensitive.value),
+  buildHighlighter(
+    searchedQuery.value,
+    searchedIsRegex.value,
+    searchedCaseSensitive.value,
+    disabledGroups.value,
+  ),
 );
 
 // Parts are cached per hit object: rows re-render on expand and scroll far
@@ -274,6 +584,175 @@ function lineParts(hit: SearchHit): HighlightPart[] {
   return parts;
 }
 
+// --- Extract only: show (and export) just the matched part per line ---
+
+const EXTRACT_KEY = 'loglooker.extractOnly';
+const extractOnly = ref(localStorage.getItem(EXTRACT_KEY) === '1');
+watch(extractOnly, (on) => localStorage.setItem(EXTRACT_KEY, on ? '1' : '0'));
+
+// Extraction only makes sense for a regex search; a substring would just yield
+// itself. When off, extract requests fall back to whole lines.
+const canExtract = computed(() => searchedIsRegex.value && searchedQuery.value !== '');
+const extractActive = computed(() => extractOnly.value && canExtract.value);
+
+const extractor = computed(() =>
+  canExtract.value
+    ? buildExtractorParts(
+        searchedQuery.value,
+        searchedIsRegex.value,
+        searchedCaseSensitive.value,
+        disabledGroups.value,
+      )
+    : null,
+);
+
+// Same reasoning as partsCache: rows re-render far more often than the query changes.
+// undefined = not yet computed; null = the line did not match (fall back to the
+// whole-line highlight); an array is the coloured extract to render.
+let extractCache = new WeakMap<SearchHit, HighlightPart[] | null>();
+watch(extractor, () => {
+  extractCache = new WeakMap();
+});
+
+function extractedParts(hit: SearchHit): HighlightPart[] | null {
+  const fn = extractor.value;
+  if (!fn) return null;
+  let value = extractCache.get(hit);
+  if (value === undefined) {
+    value = fn(hit.line);
+    extractCache.set(hit, value);
+  }
+  return value;
+}
+
+// --- What a collapsed row shows of the line ---
+
+// A single line can be megabytes (a serialised request payload). Rendered whole
+// it wraps into hundreds of visual lines, so one hit grows taller than the
+// viewport and pushes every other hit off screen. A collapsed row therefore
+// shows a window around the first match; expanding the row (or the raw viewer)
+// still shows the line in full.
+const ROW_CHARS = 600;
+// Characters of context kept before the first highlighted part, so the match
+// does not sit flush against the leading ellipsis
+const ROW_LEAD = 80;
+
+/** `parts` cut down to a ROW_CHARS window around the first coloured part, with
+ * ellipsis markers for what was left out. Returned as-is when it already fits. */
+function clampParts(parts: HighlightPart[]): HighlightPart[] {
+  const total = parts.reduce((sum, part) => sum + part.text.length, 0);
+  if (total <= ROW_CHARS) return parts;
+
+  let firstMatch = 0;
+  let offset = 0;
+  for (const part of parts) {
+    if (part.slot !== null) {
+      firstMatch = offset;
+      break;
+    }
+    offset += part.text.length;
+  }
+  const start = Math.max(0, firstMatch - ROW_LEAD);
+  const end = Math.min(total, start + ROW_CHARS);
+
+  const out: HighlightPart[] = [];
+  if (start > 0) out.push({ text: '...', slot: null });
+  offset = 0;
+  for (const part of parts) {
+    const partStart = offset;
+    offset += part.text.length;
+    if (offset <= start || partStart >= end) continue;
+    const text = part.text.slice(
+      Math.max(0, start - partStart),
+      Math.min(part.text.length, end - partStart),
+    );
+    if (text) out.push({ ...part, text });
+  }
+  if (end < total) {
+    out.push({ text: ` ... (+${(total - end).toLocaleString()} chars)`, slot: null });
+  }
+  return out;
+}
+
+// Same reasoning as partsCache: the clamped window only changes with the query
+// or the extract toggle, while rows re-render on every scroll
+let displayCache = new WeakMap<SearchHit, HighlightPart[]>();
+watch([highlighter, extractor, extractActive], () => {
+  displayCache = new WeakMap();
+});
+
+/** The coloured parts a collapsed row renders for a hit. */
+function displayParts(hit: SearchHit): HighlightPart[] {
+  let parts = displayCache.get(hit);
+  if (!parts) {
+    const extracted = extractActive.value ? extractedParts(hit) : null;
+    parts = clampParts(extracted ?? lineParts(hit));
+    displayCache.set(hit, parts);
+  }
+  return parts;
+}
+
+// --- Copy / export the whole result, one line per hit ---
+
+const exportBusy = ref(false);
+const exportMsg = ref<string | null>(null);
+
+function exportRequest(path: string | null): ExportRequest {
+  return {
+    query: searchedQuery.value,
+    isRegex: searchedIsRegex.value,
+    caseSensitive: searchedCaseSensitive.value,
+    extract: extractActive.value,
+    path,
+    maxLines: path ? null : CLIPBOARD_MAX_LINES,
+    excludeGroups: [...disabledGroups.value],
+  };
+}
+
+async function copyMatches() {
+  if (!meta.value || exportBusy.value) return;
+  exportBusy.value = true;
+  exportMsg.value = null;
+  error.value = null;
+  try {
+    const result = await invoke<ExportResult>('export_matches', { request: exportRequest(null) });
+    await navigator.clipboard.writeText(result.text ?? '');
+    exportMsg.value = result.truncated
+      ? `Copied ${result.exported.toLocaleString()} of ${result.total.toLocaleString()} lines (clipboard limit ${CLIPBOARD_MAX_LINES.toLocaleString()}).`
+      : `Copied ${result.exported.toLocaleString()} lines.`;
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    exportBusy.value = false;
+  }
+}
+
+async function exportToFile() {
+  if (!meta.value || exportBusy.value) return;
+  error.value = null;
+  let path: string | null;
+  try {
+    path = await save({
+      defaultPath: extractActive.value ? 'matches.txt' : 'log-lines.txt',
+      filters: [{ name: 'Text', extensions: ['txt'] }],
+    });
+  } catch (e) {
+    error.value = String(e);
+    return;
+  }
+  if (!path) return;
+  exportBusy.value = true;
+  exportMsg.value = null;
+  try {
+    const result = await invoke<ExportResult>('export_matches', { request: exportRequest(path) });
+    exportMsg.value = `Exported ${result.exported.toLocaleString()} lines to ${result.savedPath}.`;
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    exportBusy.value = false;
+  }
+}
+
 // Colour legend for the searched query's capture groups, shown above the results
 const groupChips = computed(() =>
   (meta.value?.groupNames ?? []).map((name, i) => ({ name, slot: (i % 8) + 1 })),
@@ -285,7 +764,7 @@ const progressText = computed(() => {
   if (p.phase === 'sorting') return `Sorting ${p.hits.toLocaleString()} hits...`;
   if (p.filesTotal === 0) return 'No cached files in range...';
   return (
-    `Scanning files ${p.filesDone}/${p.filesTotal} — ` +
+    `Scanning files ${p.filesDone}/${p.filesTotal} - ` +
     `${p.hits.toLocaleString()} hits, ${p.linesScanned.toLocaleString()} lines`
   );
 });
@@ -316,12 +795,7 @@ onUnmounted(() => {
       class="mb-4 px-4 py-2 rounded-md bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-400 flex items-center justify-between"
     >
       <span class="break-all">{{ error }}</span>
-      <button
-        class="ml-4 shrink-0 hover:underline"
-        @click="error = null"
-      >
-        Dismiss
-      </button>
+      <button class="ml-4 shrink-0 hover:underline" @click="error = null">Dismiss</button>
     </div>
 
     <div class="flex items-center gap-2 mb-2">
@@ -338,27 +812,35 @@ onUnmounted(() => {
         class="flex-1 px-3 py-1.5 text-sm font-mono rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800"
         :class="showBuilder ? 'text-gray-500 dark:text-gray-400' : ''"
         :title="showBuilder ? 'The builder owns the query while it is open' : ''"
-        @keydown.enter="search"
+        @keydown.enter="search()"
+      />
+      <button
+        class="px-4 py-1.5 text-xs font-semibold rounded-md border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
+        :disabled="searching || store.selectedServices.length === 0"
+        :title="`Scan only until the first ${PREVIEW_LIMIT} hits - quick way to check the query before a full search`"
+        @click="search(true)"
       >
+        Preview
+      </button>
       <button
         class="px-4 py-1.5 text-xs font-semibold rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 transition-colors"
         :disabled="searching || store.selectedServices.length === 0"
-        @click="search"
+        @click="search()"
       >
         {{ searching ? 'Searching...' : 'Search' }}
       </button>
     </div>
 
-    <div class="flex items-center gap-4 mb-4 text-xs text-gray-600 dark:text-gray-400">
-      <BaseCheckbox
-        v-model="isRegex"
-        :disabled="showBuilder"
+    <div class="flex items-center gap-4 mb-2 text-xs text-gray-600 dark:text-gray-400">
+      <BaseCheckbox v-model="isRegex" :disabled="showBuilder"> Regex </BaseCheckbox>
+      <BaseCheckbox v-model="caseSensitive"> Case sensitive </BaseCheckbox>
+      <button
+        class="w-5 h-5 flex items-center justify-center rounded-full border border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:border-blue-400 dark:hover:border-blue-600"
+        title="Regex syntax guide and examples"
+        @click="showRegexGuide = true"
       >
-        Regex
-      </BaseCheckbox>
-      <BaseCheckbox v-model="caseSensitive">
-        Case sensitive
-      </BaseCheckbox>
+        ?
+      </button>
       <button
         class="px-2 py-1 border rounded"
         :class="
@@ -373,38 +855,15 @@ onUnmounted(() => {
       </button>
       <label class="flex items-center gap-1.5">
         Context
-        <select
-          v-model.number="contextLines"
-          class="px-1 py-0.5 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800"
-        >
-          <option :value="0">0</option>
-          <option :value="2">2</option>
-          <option :value="5">5</option>
-          <option :value="10">10</option>
-        </select>
+        <BaseSelect v-model="contextLines" :options="CONTEXT_OPTIONS" />
       </label>
 
-      <select
-        class="px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800"
-        @change="
-          (e) => {
-            const saved = allQueries[Number((e.target as HTMLSelectElement).value)];
-            if (saved) applyQuery(saved);
-            (e.target as HTMLSelectElement).value = '';
-          }
-        "
-      >
-        <option value="">
-          Saved queries...
-        </option>
-        <option
-          v-for="(saved, i) in allQueries"
-          :key="i"
-          :value="i"
-        >
-          {{ saved.name }}
-        </option>
-      </select>
+      <BaseSelect
+        v-model="savedPick"
+        :options="savedQueryOptions"
+        placeholder="Saved queries..."
+        @change="pickSavedQuery"
+      />
       <button
         class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
         :disabled="!query"
@@ -412,22 +871,204 @@ onUnmounted(() => {
       >
         Save query
       </button>
+      <button
+        class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
+        :disabled="!query"
+        @click="openSaveAs"
+      >
+        Save as
+      </button>
+      <button
+        class="px-2 py-1 border rounded disabled:opacity-50"
+        :class="
+          showManageQueries
+            ? 'border-blue-500 text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30'
+            : 'border-gray-300 dark:border-gray-600 hover:text-gray-800 dark:hover:text-gray-200'
+        "
+        :disabled="store.config.savedQueries.length === 0"
+        @click="showManageQueries = !showManageQueries"
+      >
+        Manage
+      </button>
 
       <span class="ml-auto">
         {{ store.selectedServices.length }} services selected ({{ store.environment }}),
         {{ store.dateFrom }} → {{ store.dateTo }}
-        <router-link
-          to="/"
-          class="text-blue-500 hover:underline"
-        >change</router-link>
+        <router-link to="/" class="text-blue-500 hover:underline">change</router-link>
       </span>
     </div>
 
-    <QueryBuilder
-      v-if="showBuilder"
-      @compiled="onCompiled"
-      @search="search"
-    />
+    <div class="flex items-center gap-3 mb-4 text-xs text-gray-600 dark:text-gray-400">
+      <BaseCheckbox
+        v-model="timeEnabled"
+        title="Limit results to entries between two instants inside the selected date range"
+      >
+        Time filter ({{ timeMode === 'utc' ? 'UTC' : 'local' }})
+      </BaseCheckbox>
+      <template v-if="timeEnabled">
+        <div class="flex items-center gap-1.5">
+          from
+          <DateTimePicker v-model="timeFrom" aria-label="Čas od" :utc="timeMode === 'utc'" />
+        </div>
+        <div class="flex items-center gap-1.5">
+          to
+          <DateTimePicker
+            v-model="timeTo"
+            aria-label="Čas do"
+            align="right"
+            :utc="timeMode === 'utc'"
+          />
+        </div>
+        <span v-if="timeWindowInvalid" class="text-red-600 dark:text-red-400">
+          "from" is after "to"
+        </span>
+      </template>
+    </div>
+
+    <Teleport to="body">
+      <div
+        v-if="showManageQueries && store.config.savedQueries.length"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+        @click.self="showManageQueries = false"
+      >
+        <div
+          class="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[80vh] flex flex-col"
+        >
+          <div
+            class="flex items-center justify-between px-5 py-3 border-b border-gray-200 dark:border-gray-700"
+          >
+            <h2 class="text-sm font-medium text-gray-700 dark:text-gray-200">Saved queries</h2>
+            <button
+              class="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+              @click="showManageQueries = false"
+            >
+              &times;
+            </button>
+          </div>
+          <ul class="flex flex-col gap-1 px-5 py-3 overflow-y-auto">
+            <li
+              v-for="(saved, i) in store.config.savedQueries"
+              :key="i"
+              class="flex items-center gap-2 text-sm"
+            >
+              <span class="shrink-0 whitespace-nowrap">{{ saved.name }}</span>
+              <code class="truncate min-w-0 text-xs text-gray-400 dark:text-gray-500">{{
+                saved.query
+              }}</code>
+              <div class="ml-auto flex shrink-0 gap-1">
+                <button
+                  class="px-2 py-0.5 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200"
+                  @click="renameSavedQuery(saved)"
+                >
+                  Rename
+                </button>
+                <button
+                  class="px-2 py-0.5 border border-gray-300 dark:border-gray-600 rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30"
+                  @click="removeSavedQuery(saved)"
+                >
+                  Remove
+                </button>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="showSaveAs"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+        @click.self="showSaveAs = false"
+      >
+        <div
+          class="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md mx-4 max-h-[80vh] flex flex-col"
+        >
+          <div
+            class="flex items-center justify-between px-5 py-3 border-b border-gray-200 dark:border-gray-700"
+          >
+            <h2 class="text-sm font-medium text-gray-700 dark:text-gray-200">Save query as</h2>
+            <button
+              class="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+              @click="showSaveAs = false"
+            >
+              &times;
+            </button>
+          </div>
+          <div class="flex flex-col gap-3 px-5 py-4 overflow-y-auto">
+            <input
+              v-model="saveAsName"
+              type="text"
+              placeholder="New query name"
+              class="w-full px-3 py-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-sm"
+              @keydown.enter="confirmSaveAs"
+            />
+            <p v-if="saveAsClashes" class="text-xs text-amber-600 dark:text-amber-400">
+              This will overwrite the existing query "{{ saveAsName.trim() }}".
+            </p>
+            <div v-if="store.config.savedQueries.length">
+              <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">
+                Or overwrite an existing query:
+              </p>
+              <ul class="flex flex-col gap-0.5 max-h-52 overflow-y-auto">
+                <li v-for="(saved, i) in store.config.savedQueries" :key="i">
+                  <button
+                    class="w-full flex items-center gap-2 text-left text-sm px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+                    :class="
+                      saved.name === saveAsName.trim()
+                        ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
+                        : ''
+                    "
+                    @click="saveAsName = saved.name"
+                  >
+                    <span class="shrink-0 whitespace-nowrap">{{ saved.name }}</span>
+                    <code class="truncate min-w-0 text-xs text-gray-400 dark:text-gray-500">{{
+                      saved.query
+                    }}</code>
+                  </button>
+                </li>
+              </ul>
+            </div>
+          </div>
+          <div
+            class="flex justify-end gap-2 px-5 py-3 border-t border-gray-200 dark:border-gray-700"
+          >
+            <button
+              class="px-3 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200"
+              @click="showSaveAs = false"
+            >
+              Cancel
+            </button>
+            <button
+              class="px-3 py-1 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+              :disabled="!saveAsName.trim()"
+              @click="confirmSaveAs"
+            >
+              {{ saveAsClashes ? 'Overwrite' : 'Save' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <QueryBuilder v-if="showBuilder" @compiled="onCompiled" @search="search()" />
+
+    <div
+      v-if="dateRangeStale"
+      class="mb-2 px-4 py-2 rounded-md bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400 flex items-center justify-between gap-3"
+    >
+      <span>
+        These results cover {{ searchedDateFrom }} → {{ searchedDateTo }}, but the selected range is
+        now {{ store.dateFrom }} → {{ store.dateTo }}. Search again to update them.
+      </span>
+      <button
+        class="shrink-0 px-2 py-1 rounded bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50"
+        :disabled="searching || store.selectedServices.length === 0"
+        @click="rerunForDateRange"
+      >
+        Search again
+      </button>
+    </div>
 
     <div
       v-if="meta"
@@ -435,27 +1076,108 @@ onUnmounted(() => {
       :class="searching ? 'opacity-50' : ''"
     >
       <span>
-        {{ meta.totalHits.toLocaleString() }} hits — {{ meta.filesScanned }} files,
+        {{ meta.totalHits.toLocaleString() }} hits - {{ meta.filesScanned }} files,
         {{ meta.linesScanned.toLocaleString() }} lines in {{ meta.durationMs }} ms
       </span>
+      <template v-if="searchedPreview">
+        <span
+          class="text-blue-600 dark:text-blue-400"
+          :title="
+            meta.truncated
+              ? 'The preview stopped at the first hits. Refine the query and preview again, or run the full search.'
+              : 'The preview already found every match, so this result is complete.'
+          "
+        >
+          {{
+            meta.truncated
+              ? `preview - first ${meta.totalHits.toLocaleString()} hits, more may exist`
+              : 'preview - all matches found, result is complete'
+          }}
+        </span>
+        <button
+          v-if="meta.truncated"
+          class="px-2 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50"
+          :disabled="searching"
+          title="Run the previewed query again without the preview limit"
+          @click="continueFullSearch"
+        >
+          Run full search
+        </button>
+      </template>
       <span
+        v-else-if="meta.truncated"
+        class="text-amber-600 dark:text-amber-400"
+        title="The search stopped at the configured hit cap. Narrow the query or date range, or raise the cap in the memory settings (top right)."
+      >
+        capped at {{ meta.totalHits.toLocaleString() }} hits - result is incomplete
+      </span>
+      <button
         v-for="chip in groupChips"
         :key="chip.name"
-        class="flex items-center gap-1.5 text-gray-600 dark:text-gray-300"
+        type="button"
+        class="flex items-center gap-1.5 rounded px-1 -mx-0.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/50"
+        :class="disabledGroups.has(chip.name) ? 'opacity-40' : ''"
+        :title="
+          disabledGroups.has(chip.name)
+            ? `Group '${chip.name}' is off - click to highlight it and include it in Extract match`
+            : `Group '${chip.name}' - click to stop highlighting it and leave it out of Extract match`
+        "
+        @click="toggleGroup(chip.name)"
       >
         <span
-          class="w-2.5 h-2.5 rounded-sm shrink-0"
-          :style="{ backgroundColor: `var(--chart-${chip.slot})` }"
+          class="w-2.5 h-2.5 rounded-sm shrink-0 border"
+          :style="{
+            borderColor: `var(--chart-${chip.slot})`,
+            backgroundColor: disabledGroups.has(chip.name)
+              ? 'transparent'
+              : `var(--chart-${chip.slot})`,
+          }"
         />
-        <span class="truncate max-w-[10rem]">{{ chip.name }}</span>
-      </span>
+        <span
+          class="truncate max-w-[10rem]"
+          :class="disabledGroups.has(chip.name) ? 'line-through' : ''"
+          >{{ chip.name }}</span
+        >
+      </button>
       <span v-if="tab === 'table' && hits.length < meta.totalHits">
         showing {{ hits.length.toLocaleString() }} (scroll to load more)
       </span>
 
-      <div class="ml-auto flex items-center rounded-md border border-gray-300 dark:border-gray-600 overflow-hidden">
+      <BaseCheckbox
+        v-if="canExtract"
+        v-model="extractOnly"
+        title="Show only the matched part of each line (the first capture group)"
+      >
+        Extract match
+      </BaseCheckbox>
+      <button
+        v-if="meta.totalHits > 0"
+        class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
+        :disabled="exportBusy"
+        :title="
+          extractActive
+            ? 'Copy the extracted match of every hit, one per line'
+            : 'Copy every matching line, one per line'
+        "
+        @click="copyMatches"
+      >
+        Copy
+      </button>
+      <button
+        v-if="meta.totalHits > 0"
+        class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
+        :disabled="exportBusy"
+        title="Export all matches to a text file, one per line"
+        @click="exportToFile"
+      >
+        Export...
+      </button>
+
+      <div
+        class="ml-auto flex items-center rounded-md border border-gray-300 dark:border-gray-600 overflow-hidden"
+      >
         <button
-          v-for="option in (['table', 'chart'] as const)"
+          v-for="option in ['table', 'chart'] as const"
           :key="option"
           class="px-3 py-1 capitalize"
           :class="
@@ -468,198 +1190,117 @@ onUnmounted(() => {
           {{ option }}
         </button>
       </div>
-
-      <div
-        v-if="tab === 'table'"
-        class="relative"
-      >
-        <button
-          class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200"
-          @click="showColumnMenu = !showColumnMenu"
-        >
-          Columns
-        </button>
-        <div
-          v-if="showColumnMenu"
-          class="absolute right-0 mt-1 z-20 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg p-1"
-        >
-          <BaseCheckbox
-            v-for="col in ALL_COLUMNS"
-            :key="col.key"
-            :model-value="!columnPrefs.hidden.includes(col.key)"
-            class="flex px-2 py-1 whitespace-nowrap hover:bg-gray-50 dark:hover:bg-gray-700 rounded"
-            @update:model-value="toggleColumn(col.key)"
-          >
-            {{ col.label }}
-          </BaseCheckbox>
-        </div>
-      </div>
     </div>
 
     <div
-      v-if="meta"
-      class="relative"
+      v-if="exportMsg"
+      class="mb-2 px-3 py-1.5 rounded-md bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 text-xs text-green-700 dark:text-green-400 flex items-center justify-between gap-3"
     >
-      <SearchChart
-        v-if="tab === 'chart'"
-        :query="searchedQuery"
-      />
+      <span class="break-all">{{ exportMsg }}</span>
+      <button class="shrink-0 hover:underline" @click="exportMsg = null">Dismiss</button>
+    </div>
+
+    <div v-if="meta" class="relative">
+      <SearchChart v-if="tab === 'chart'" :query="searchedQuery" />
 
       <div
         v-if="tab === 'table'"
         class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden"
       >
-        <div
-          class="max-h-[calc(100vh-260px)] overflow-auto"
-          @scroll.passive="onResultsScroll"
+        <DataTable
+          table-id="search"
+          :columns="columns"
+          :rows="hits"
+          table-class="min-w-[48rem] font-mono"
+          scroll-class="max-h-[calc(100vh-260px)]"
+          clickable-rows
+          row-class="align-top"
+          :sort="sort"
+          :loading="loadingMore && hits.length === 0"
+          :expanded="(_, i) => expanded.has(i)"
+          @update:sort="onSort"
+          @row-click="(_, i) => toggleExpanded(i)"
+          @scroll="onResultsScroll"
         >
-          <table class="w-full min-w-[48rem] text-xs font-mono">
-            <thead>
-              <tr>
-                <th
-                  v-for="col in visibleColumns"
-                  :key="col.key"
-                  draggable="true"
-                  class="sticky top-0 z-10 bg-white dark:bg-gray-800 text-left py-2 px-3 font-medium text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-700 cursor-pointer select-none"
-                  :class="[col.width, dragKey === col.key ? 'opacity-50' : '']"
-                  :title="`Sort by ${col.label}; drag to reorder`"
-                  @dragstart="dragKey = col.key"
-                  @dragend="dragKey = null"
-                  @dragover.prevent
-                  @drop="onColumnDrop(col.key)"
-                  @click="sortBy(col)"
-                >
-                  {{ col.label }}
-                  <span v-if="sortField === col.sortField">{{ sortAsc ? '↑' : '↓' }}</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <template
-                v-for="(hit, i) in hits"
-                :key="i"
-              >
-                <tr
-                  class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer align-top"
-                  @click="toggleExpanded(i)"
-                >
-                  <td
-                    v-for="col in visibleColumns"
-                    :key="col.key"
-                    class="py-1.5 px-3"
-                    :class="{
-                      'text-gray-500 dark:text-gray-400 whitespace-nowrap': col.key === 'time',
-                      'text-gray-500 dark:text-gray-400': col.key === 'fields',
-                      'text-gray-700 dark:text-gray-300 break-all': col.key === 'line',
-                    }"
-                  >
-                    <template v-if="col.key === 'time'">
-                      {{ times[i].text }}
-                      <span
-                        v-if="times[i].zone"
-                        class="text-gray-400 dark:text-gray-500"
-                      >({{ times[i].zone }})</span>
-                    </template>
-                    <template v-else-if="col.key === 'service'">
-                      <span
-                        class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded"
-                        :class="
-                          hit.serviceId.startsWith('production/')
-                            ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
-                            : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
-                        "
-                      >
-                        {{ serviceNames[hit.serviceId] ?? hit.serviceId }}
-                      </span>
-                    </template>
-                    <template v-else-if="col.key === 'fields'">
-                      <div
-                        v-if="hit.fields.operation"
-                        class="truncate"
-                        :title="hit.fields.operation"
-                      >
-                        {{ hit.fields.operation }}
-                      </div>
-                      <div
-                        v-if="hit.fields.idLogin"
-                        class="truncate text-[10px] text-gray-400"
-                        :title="hit.fields.idLogin"
-                      >
-                        {{ hit.fields.idLogin }}
-                      </div>
-                    </template>
-                    <template v-else>
-                      <template
-                        v-for="(part, p) in lineParts(hit)"
-                        :key="p"
-                      >
-                        <span
-                          v-if="part.slot !== null"
-                          :class="slotClass(part.slot)"
-                        >{{ part.text }}</span><template v-else>
-                          {{ part.text }}
-                        </template>
-                      </template>
-                      <button
-                        class="text-gray-400 text-[10px] whitespace-nowrap hover:text-blue-500 hover:underline"
-                        title="Open the raw file at this line"
-                        @click.stop="rawView = hit"
-                      >
-                        — {{ hit.file }}:{{ hit.lineNumber }}
-                      </button>
-                    </template>
-                  </td>
-                </tr>
-                <tr
-                  v-if="expanded.has(i)"
-                  class="border-b border-gray-200 dark:border-gray-700"
-                >
-                  <td
-                    :colspan="visibleColumns.length"
-                    class="px-3 py-2 bg-gray-50 dark:bg-gray-900/50"
-                  >
-                    <pre
-                      class="whitespace-pre-wrap break-all text-[11px] leading-relaxed"
-                    ><span class="text-gray-400">{{ hit.contextBefore.join('\n') }}</span>
+          <template #time="{ index }">
+            {{ times[index].text }}
+            <span v-if="times[index].zone" class="text-gray-400 dark:text-gray-500"
+              >({{ times[index].zone }})</span
+            >
+          </template>
+          <template #service="{ row: hit }">
+            <span
+              class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded"
+              :class="
+                hit.serviceId.startsWith('production/')
+                  ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+                  : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
+              "
+            >
+              {{ serviceNames[hit.serviceId] ?? hit.serviceId }}
+            </span>
+          </template>
+          <!-- One slot per plugin-declared field, keyed by its column key -->
+          <template
+            v-for="field in meta?.fields ?? []"
+            #[field.key]="{ row: hit }"
+            :key="field.key"
+          >
+            <div v-if="hit.fields[field.key]" class="truncate" :title="hit.fields[field.key]">
+              {{ hit.fields[field.key] }}
+            </div>
+          </template>
+          <template #line="{ row: hit }">
+            <template v-for="(part, p) in displayParts(hit)" :key="p">
+              <span v-if="part.slot !== null" :class="partClass(part)" :style="partStyle(part)">{{
+                part.text
+              }}</span
+              ><template v-else>
+                {{ part.text }}
+              </template>
+            </template>
+            <button
+              class="text-gray-400 text-[10px] whitespace-nowrap hover:text-blue-500 hover:underline"
+              title="Open the raw file at this line"
+              @click.stop="rawView = hit"
+            >
+              - {{ hit.file }}:{{ hit.lineNumber }}
+            </button>
+          </template>
+          <template #expansion="{ row: hit }">
+            <div class="px-3 py-2 bg-gray-50 dark:bg-gray-900/50">
+              <pre
+                class="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed"
+              ><span class="text-gray-400">{{ hit.contextBefore.join('\n') }}</span>
   <span class="text-gray-900 dark:text-gray-100 font-semibold"><template
     v-for="(part, p) in lineParts(hit)"
     :key="p"
   ><span
     v-if="part.slot !== null"
-    :class="slotClass(part.slot)"
+    :class="partClass(part)"
+    :style="partStyle(part)"
   >{{ part.text }}</span><template v-else>{{ part.text }}</template></template></span>
   <span class="text-gray-400">{{ hit.contextAfter.join('\n') }}</span></pre>
-                    <button
-                      class="mt-2 px-2 py-1 text-[10px] border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
-                      @click.stop="rawView = hit"
-                    >
-                      Open raw file at line {{ hit.lineNumber.toLocaleString() }}
-                    </button>
-                  </td>
-                </tr>
-              </template>
-              <tr v-if="loadingMore">
-                <td
-                  :colspan="visibleColumns.length"
-                  class="py-3 text-center text-gray-400"
-                >
-                  <span class="inline-flex items-center gap-2">
-                    <Spinner size="sm" />
-                    Loading more ({{ hits.length.toLocaleString() }}/{{ meta.totalHits.toLocaleString() }})...
-                  </span>
-                </td>
-              </tr>
-              <tr v-if="meta.totalHits === 0">
-                <td
-                  :colspan="visibleColumns.length"
-                  class="py-8 text-center text-gray-400"
-                >
-                  No matches.
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+              <button
+                class="mt-2 px-2 py-1 text-[10px] border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+                @click.stop="rawView = hit"
+              >
+                Open raw file at line {{ hit.lineNumber.toLocaleString() }}
+              </button>
+            </div>
+          </template>
+          <template #footer>
+            <div v-if="loadingMore && hits.length > 0" class="py-3 text-center text-gray-400">
+              <span class="inline-flex items-center gap-2">
+                <Spinner size="sm" />
+                Loading more ({{ hits.length.toLocaleString() }}/{{
+                  meta.totalHits.toLocaleString()
+                }})...
+              </span>
+            </div>
+          </template>
+          <template #empty> No matches. </template>
+        </DataTable>
       </div>
 
       <div
@@ -680,28 +1321,33 @@ onUnmounted(() => {
           >
             {{ progress.currentFile }}
           </div>
+          <button
+            class="mt-1 px-3 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-md text-gray-600 dark:text-gray-400 hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50"
+            :disabled="cancelRequested"
+            @click="cancelSearch"
+          >
+            {{ cancelRequested ? 'Cancelling...' : 'Cancel' }}
+          </button>
         </div>
       </div>
     </div>
 
-    <div
-      v-else-if="searching"
-      class="py-16 flex flex-col items-center gap-3 text-gray-400 text-sm"
-    >
+    <div v-else-if="searching" class="py-16 flex flex-col items-center gap-3 text-gray-400 text-sm">
       <Spinner />
       <div>{{ progressText }}</div>
-      <div
-        v-if="progress?.currentFile"
-        class="text-xs font-mono"
-      >
+      <div v-if="progress?.currentFile" class="text-xs font-mono">
         {{ progress.currentFile }}
       </div>
+      <button
+        class="px-3 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded-md text-gray-600 dark:text-gray-400 hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50"
+        :disabled="cancelRequested"
+        @click="cancelSearch"
+      >
+        {{ cancelRequested ? 'Cancelling...' : 'Cancel' }}
+      </button>
     </div>
 
-    <div
-      v-else
-      class="py-16 text-center text-gray-400 text-sm"
-    >
+    <div v-else class="py-16 text-center text-gray-400 text-sm">
       Select services and a date range on the Services page, sync, then search here.
     </div>
 
@@ -717,5 +1363,7 @@ onUnmounted(() => {
       :initial-case-sensitive="searchedCaseSensitive"
       @close="rawView = null"
     />
+
+    <RegexGuide v-if="showRegexGuide" @close="showRegexGuide = false" />
   </div>
 </template>

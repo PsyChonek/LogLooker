@@ -1,0 +1,165 @@
+name: Release
+
+# Manual, like SqlPlanForDummies: pick a bump, and CI does the whole release -
+# version bump, MSI build, winget manifests, tag, GitHub release, winget PR.
+# Nothing has to be built or tagged locally first.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      skip_tests:
+        description: 'Skip CI tests before release'
+        required: false
+        default: false
+        type: boolean
+      skip_winget:
+        description: 'Build and release, but do not open a winget PR'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    name: Run CI Tests
+    if: ${{ !inputs.skip_tests }}
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [tests]
+    # `always()` so a skipped test job does not cancel the release, while a
+    # failed one still does
+    if: always() && (needs.tests.result == 'success' || needs.tests.result == 'skipped')
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # The version lives in three files that must agree: package.json,
+      # tauri.conf.json (which decides the MSI name) and Cargo.toml.
+      # scripts/build.ps1 does the same thing for local builds.
+      - name: Bump version
+        id: version
+        shell: bash
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT -> $NEW_VERSION"
+
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '$NEW_VERSION';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          node -e "
+            const fs = require('fs');
+            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            conf.version = '$NEW_VERSION';
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
+          "
+          sed -i "0,/^version = /s/^version = .*/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
+
+      - name: Build MSI
+        run: npm run tauri build
+
+      - name: Collect artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Path release-artifacts -Force | Out-Null
+          # Tauri's own file names are kept: winget's InstallerUrl points at them
+          # and the winget-releaser regex below matches them
+          $found = Get-ChildItem -Path src-tauri/target -Recurse -Filter "*_${version}_*.msi" -ErrorAction SilentlyContinue
+          if (-not $found) { throw "No MSI for version $version under src-tauri/target" }
+          $found | ForEach-Object {
+            Copy-Item $_.FullName release-artifacts/
+            Write-Host "  $($_.Name)"
+          }
+          Get-FileHash release-artifacts/*.msi -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $(Split-Path $_.Path -Leaf)" } |
+            Out-File release-artifacts/SHA256SUMS.txt -Encoding utf8
+
+      # Reads each MSI's SHA256 and ProductCode out of the file, so the manifests
+      # always describe the artifact actually being attached
+      - name: Generate winget manifests
+        shell: pwsh
+        run: ./scripts/update-winget-manifests.ps1 -Version "${{ steps.version.outputs.version }}" -ArtifactsPath "release-artifacts"
+
+      - name: Commit, tag and push
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock winget/
+          # [skip ci] so the release commit does not trigger the push-based CI run
+          git commit -m "release: v${{ steps.version.outputs.version }} [skip ci]"
+          # Forced, so a retry after a failed run is not blocked by its own tag
+          git tag -f -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          git push origin HEAD:main
+          git push -f origin "v${{ steps.version.outputs.version }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: LogLooker v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: release-artifacts/*
+          body: |
+            The installer is not code-signed, so Windows SmartScreen warns on
+            first run ("More info" -> "Run anyway").
+
+            ```
+            winget install PsyChonek.LogLooker
+            ```
+
+  winget:
+    needs: release
+    if: always() && needs.release.result == 'success' && !inputs.skip_winget
+    runs-on: windows-latest
+    # Gates the WINGET_TOKEN behind an environment, so a fork's workflow cannot
+    # reach it
+    environment: release
+    steps:
+      - name: Publish to winget
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: PsyChonek.LogLooker
+          token: ${{ secrets.WINGET_TOKEN }}
+          release-tag: v${{ needs.release.outputs.version }}
+          fork-user: PsyChonek
+          installers-regex: '_(x64|arm64)_en-US\.msi$'

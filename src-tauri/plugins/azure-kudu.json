@@ -1,0 +1,108 @@
+{
+  "$schema": "https://raw.githubusercontent.com/PsyChonek/LogLooker/main/docs/pack.schema.json",
+  "id": "azure-kudu",
+  "name": "Azure App Service (Kudu)",
+  "version": "1.0.0",
+  "description": "Reads logs from an Azure App Service over the Kudu VFS API, authenticating with the Azure CLI. Covers the three places an App Service commonly keeps them: an NLog applogs folder, the classic App_Data/Log.txt, and Linux container stdout under LogFiles.",
+
+  "environments": [
+    { "id": "test", "label": "TEST" },
+    { "id": "production", "label": "PRODUCTION" }
+  ],
+
+  "source": { "type": "kudu", "auth": "az-cli" },
+
+  "discovery": { "type": "none" },
+
+  "logLocations": [
+    {
+      "id": "core-applogs",
+      "label": "NLog applogs (one file per day)",
+      "dir": "applogs",
+      "file": "^log-(?<y>\\d{4})-(?<m>\\d{2})-(?<d>\\d{2})(?:_\\d{1,2})?\\.log$"
+    },
+    {
+      "id": "docker-logfiles",
+      "label": "Container stdout (LogFiles)",
+      "dir": "LogFiles",
+      "file": "^(?<y>\\d{4})_(?<m>\\d{2})_(?<d>\\d{2})_(?<instance>[A-Za-z0-9]+)_default_docker(?:\\.\\d+)?\\.log$"
+    },
+    {
+      "id": "framework-app-data",
+      "label": "App_Data/Log.txt (single growing file)",
+      "dir": "site/wwwroot/App_Data",
+      "file": "(?i)^Log\\.txt$",
+      "dated": false
+    }
+  ],
+
+  "timestamps": ["iso8601", "dotted-dmy", "us-mdy"],
+
+  "fields": [
+    {
+      "key": "level",
+      "label": "Level",
+      "regex": "\\b(?<v>TRACE|DEBUG|INFO|INFORMATION|WARN|WARNING|ERROR|FATAL|CRITICAL)\\b",
+      "type": "string"
+    },
+    {
+      "key": "durationMs",
+      "label": "Duration (ms)",
+      "gate": "ms",
+      "regex": " (?<v>\\d+(?:\\.\\d+)?)ms\\b",
+      "type": "number"
+    },
+    {
+      "key": "request",
+      "label": "Request",
+      "gate": "HTTP/",
+      "regex": "HTTP/[\\d.]+ (?<v>[A-Z]+ \\S+)",
+      "type": "string"
+    },
+    {
+      "key": "exception",
+      "label": "Exception",
+      "gate": "Exception",
+      "regex": "(?<v>[A-Za-z0-9_.]*Exception)",
+      "type": "string"
+    }
+  ],
+
+  "presets": [
+    { "name": "Errors", "query": "\\b(ERROR|FATAL|CRITICAL)\\b", "isRegex": true },
+    {
+      "name": "Warnings and worse",
+      "query": "\\b(WARN|WARNING|ERROR|FATAL|CRITICAL)\\b",
+      "isRegex": true
+    },
+    { "name": "Exceptions", "query": "Exception", "isRegex": false },
+    { "name": "Requests over 1s", "query": " \\d{4,}(\\.\\d+)?ms\\b", "isRegex": true }
+  ],
+
+  "charts": [
+    { "name": "Hits over time", "mode": "timeline", "bucket": "auto", "groupBy": "none" },
+    {
+      "name": "By level",
+      "mode": "category",
+      "groupBy": "field:level",
+      "metric": "count",
+      "topN": 10
+    },
+    {
+      "name": "Duration p95 over time",
+      "mode": "timeline",
+      "bucket": "auto",
+      "groupBy": "none",
+      "metric": "p95",
+      "value": "field:durationMs"
+    },
+    {
+      "name": "Slowest requests",
+      "mode": "category",
+      "groupBy": "field:request",
+      "metric": "p95",
+      "value": "field:durationMs",
+      "topN": 20
+    }
+  ]
+}

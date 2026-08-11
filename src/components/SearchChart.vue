@@ -4,8 +4,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import BaseCheckbox from '@/components/BaseCheckbox.vue';
+import BaseSelect, { type SelectOption } from '@/components/BaseSelect.vue';
 import ChartCanvas from '@/components/ChartCanvas.vue';
 import { displayZone, shiftLogLabel } from '@/composables/useTimeMode';
+import { useAppStore } from '@/stores/appStore';
 import type { ChartData, ChartRequest } from '@/types';
 
 const SETTINGS_KEY = 'loglooker.chartSettings';
@@ -35,7 +37,9 @@ const DEFAULTS: ChartSettings = {
   groupBy: 'none',
   customRegex: null,
   metric: 'count',
-  valueSource: 'duration',
+  valueSource: 'field',
+  groupField: null,
+  valueField: null,
   topN: 5,
   type: 'bar',
   stacked: true,
@@ -61,6 +65,12 @@ const needsRegex = computed(
     settings.value.groupBy === 'custom' ||
     (settings.value.metric !== 'count' && settings.value.valueSource === 'custom'),
 );
+
+// What can be grouped or measured comes from the loaded plugins, not from the
+// app: a plugin for a different log shape brings its own dimensions.
+const store = useAppStore();
+const groupFields = computed(() => store.fields);
+const valueFields = computed(() => store.fields.filter((field) => field.type === 'number'));
 const isCategory = computed(() => settings.value.mode === 'category');
 const topNOptions = computed(() => (isCategory.value ? CATEGORY_TOP_N : TIMELINE_TOP_N));
 
@@ -73,19 +83,71 @@ function request(): ChartRequest {
     customRegex: needsRegex.value ? s.customRegex : null,
     metric: s.metric,
     valueSource: s.valueSource,
+    groupField: s.groupBy === 'field' ? s.groupField : null,
+    valueField: s.valueSource === 'field' ? s.valueField : null,
     topN: s.topN,
   };
 }
 
-// A category chart of nothing is a single bar — the one thing a bar chart must
-// never be. Grouping is what gives it its bars, so pick one on the way in.
+// A category chart of nothing is a single bar - the one thing a bar chart must
+// never be. Grouping is what gives it its bars, so pick one on the way in:
+// the first plugin-declared field if there is one, else the service.
 watch(
   () => settings.value.mode,
   (mode) => {
     if (mode === 'category' && settings.value.groupBy === 'none') {
-      settings.value.groupBy = 'operation';
+      const first = groupFields.value[0];
+      groupChoice.value = first ? `field:${first.key}` : 'service';
     }
   },
+);
+
+// The group-by and value dropdowns each hold one string, with a field written
+// as `field:<key>` - the same form a plugin's chart presets use. Keeping it to
+// one control per dimension avoids a second dropdown that only sometimes exists.
+const groupChoice = computed({
+  get: () =>
+    settings.value.groupBy === 'field'
+      ? `field:${settings.value.groupField ?? ''}`
+      : settings.value.groupBy,
+  set: (choice: string) => {
+    const key = choice.startsWith('field:') ? choice.slice('field:'.length) : null;
+    settings.value.groupBy = key ? 'field' : (choice as ChartRequest['groupBy']);
+    settings.value.groupField = key;
+  },
+});
+
+const valueChoice = computed({
+  get: () =>
+    settings.value.valueSource === 'custom' ? 'custom' : `field:${settings.value.valueField ?? ''}`,
+  set: (choice: string) => {
+    const key = choice.startsWith('field:') ? choice.slice('field:'.length) : null;
+    settings.value.valueSource = key ? 'field' : 'custom';
+    settings.value.valueField = key;
+  },
+});
+
+// A field the loaded plugins no longer declare cannot be charted; fall back to
+// the first that fits so a saved chart never sends an unresolvable request
+watch(
+  [() => settings.value.groupBy, groupFields],
+  () => {
+    if (settings.value.groupBy !== 'field') return;
+    if (!groupFields.value.some((f) => f.key === settings.value.groupField)) {
+      settings.value.groupField = groupFields.value[0]?.key ?? null;
+    }
+  },
+  { immediate: true },
+);
+watch(
+  [() => settings.value.valueSource, valueFields],
+  () => {
+    if (settings.value.valueSource !== 'field') return;
+    if (!valueFields.value.some((f) => f.key === settings.value.valueField)) {
+      settings.value.valueField = valueFields.value[0]?.key ?? null;
+    }
+  },
+  { immediate: true },
 );
 
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -148,9 +210,7 @@ async function openInWindow() {
 
 // --- Presentation ---
 
-const chartType = computed<'bar' | 'line'>(() =>
-  isCategory.value ? 'bar' : settings.value.type,
-);
+const chartType = computed<'bar' | 'line'>(() => (isCategory.value ? 'bar' : settings.value.type));
 const canStack = computed(
   () => !isCategory.value && settings.value.type === 'bar' && settings.value.groupBy !== 'none',
 );
@@ -196,26 +256,70 @@ const skipped = computed(() => {
   return notes;
 });
 
-const CONTROL =
-  'px-1.5 py-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800';
+const MODE_OPTIONS: SelectOption<ChartSettings['mode']>[] = [
+  { value: 'timeline', label: 'Time' },
+  { value: 'category', label: 'Category' },
+];
+
+const BUCKET_OPTIONS: SelectOption<ChartSettings['bucket']>[] = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'second', label: '1 s' },
+  { value: 'minute', label: '1 min' },
+  { value: 'fiveMinutes', label: '5 min' },
+  { value: 'fifteenMinutes', label: '15 min' },
+  { value: 'hour', label: '1 hour' },
+  { value: 'sixHours', label: '6 hours' },
+  { value: 'day', label: '1 day' },
+];
+
+const METRIC_OPTIONS: SelectOption<ChartSettings['metric']>[] = [
+  { value: 'count', label: 'Count' },
+  { value: 'sum', label: 'Sum' },
+  { value: 'avg', label: 'Average' },
+  { value: 'p50', label: 'p50' },
+  { value: 'p95', label: 'p95' },
+  { value: 'p99', label: 'p99' },
+  { value: 'min', label: 'Min' },
+  { value: 'max', label: 'Max' },
+];
+
+const TYPE_OPTIONS: SelectOption<ChartSettings['type']>[] = [
+  { value: 'bar', label: 'Bar' },
+  { value: 'line', label: 'Line' },
+];
+
+// Whatever the loaded plugins extract is offered alongside the built-in dimensions.
+const groupOptions = computed<SelectOption<string>[]>(() => [
+  ...(isCategory.value ? [] : [{ value: 'none', label: 'Nothing' }]),
+  { value: 'service', label: 'Service' },
+  { value: 'file', label: 'File' },
+  { value: 'custom', label: 'Custom regex' },
+  { value: 'matchedGroup', label: 'Matched group' },
+  ...groupFields.value.map((field) => ({ value: `field:${field.key}`, label: field.label })),
+]);
+
+// Only number fields can be aggregated; a plugin says which are.
+const valueOptions = computed<SelectOption<string>[]>(() => [
+  ...valueFields.value.map((field) => ({ value: `field:${field.key}`, label: field.label })),
+  { value: 'custom', label: 'Custom regex value' },
+]);
+
+const topNSelectOptions = computed<SelectOption<number>[]>(() =>
+  topNOptions.value.map((n) => ({ value: n, label: String(n) })),
+);
 </script>
 
 <template>
   <div>
-    <div class="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 text-xs text-gray-600 dark:text-gray-400">
+    <div
+      class="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 text-xs text-gray-600 dark:text-gray-400"
+    >
       <label class="flex items-center gap-1.5">
         X axis
-        <select
+        <BaseSelect
           v-model="settings.mode"
-          :class="CONTROL"
-        >
-          <option value="timeline">
-            Time
-          </option>
-          <option value="category">
-            Category
-          </option>
-        </select>
+          :options="MODE_OPTIONS"
+        />
       </label>
 
       <label
@@ -223,101 +327,26 @@ const CONTROL =
         class="flex items-center gap-1.5"
       >
         Bucket
-        <select
+        <BaseSelect
           v-model="settings.bucket"
-          :class="CONTROL"
-        >
-          <option value="auto">
-            Auto
-          </option>
-          <option value="second">
-            1 s
-          </option>
-          <option value="minute">
-            1 min
-          </option>
-          <option value="fiveMinutes">
-            5 min
-          </option>
-          <option value="fifteenMinutes">
-            15 min
-          </option>
-          <option value="hour">
-            1 hour
-          </option>
-          <option value="sixHours">
-            6 hours
-          </option>
-          <option value="day">
-            1 day
-          </option>
-        </select>
+          :options="BUCKET_OPTIONS"
+        />
       </label>
 
       <label class="flex items-center gap-1.5">
         Group by
-        <select
-          v-model="settings.groupBy"
-          :class="CONTROL"
-        >
-          <option
-            v-if="!isCategory"
-            value="none"
-          >
-            Nothing
-          </option>
-          <option value="service">
-            Service
-          </option>
-          <option value="operation">
-            Operation
-          </option>
-          <option value="idLogin">
-            ID_Login
-          </option>
-          <option value="file">
-            File
-          </option>
-          <option value="custom">
-            Custom regex
-          </option>
-          <option value="matchedGroup">
-            Matched group
-          </option>
-        </select>
+        <BaseSelect
+          v-model="groupChoice"
+          :options="groupOptions"
+        />
       </label>
 
       <label class="flex items-center gap-1.5">
         Metric
-        <select
+        <BaseSelect
           v-model="settings.metric"
-          :class="CONTROL"
-        >
-          <option value="count">
-            Count
-          </option>
-          <option value="sum">
-            Sum
-          </option>
-          <option value="avg">
-            Average
-          </option>
-          <option value="p50">
-            p50
-          </option>
-          <option value="p95">
-            p95
-          </option>
-          <option value="p99">
-            p99
-          </option>
-          <option value="min">
-            Min
-          </option>
-          <option value="max">
-            Max
-          </option>
-        </select>
+          :options="METRIC_OPTIONS"
+        />
       </label>
 
       <label
@@ -325,17 +354,10 @@ const CONTROL =
         class="flex items-center gap-1.5"
       >
         of
-        <select
-          v-model="settings.valueSource"
-          :class="CONTROL"
-        >
-          <option value="duration">
-            Duration (ms)
-          </option>
-          <option value="custom">
-            Custom regex value
-          </option>
-        </select>
+        <BaseSelect
+          v-model="valueChoice"
+          :options="valueOptions"
+        />
       </label>
 
       <label
@@ -343,34 +365,19 @@ const CONTROL =
         class="flex items-center gap-1.5"
       >
         Top
-        <select
-          v-model.number="settings.topN"
-          :class="CONTROL"
-        >
-          <option
-            v-for="n in topNOptions"
-            :key="n"
-            :value="n"
-          >
-            {{ n }}
-          </option>
-        </select>
+        <BaseSelect
+          v-model="settings.topN"
+          :options="topNSelectOptions"
+        />
       </label>
 
       <template v-if="!isCategory">
         <label class="flex items-center gap-1.5">
           Type
-          <select
+          <BaseSelect
             v-model="settings.type"
-            :class="CONTROL"
-          >
-            <option value="bar">
-              Bar
-            </option>
-            <option value="line">
-              Line
-            </option>
-          </select>
+            :options="TYPE_OPTIONS"
+          />
         </label>
         <BaseCheckbox
           v-if="canStack"
@@ -473,7 +480,7 @@ const CONTROL =
         v-else
         class="py-16 text-center text-sm text-gray-400"
       >
-        Nothing to chart — the search has no hits that carry what this chart needs.
+        Nothing to chart - the search has no hits that carry what this chart needs.
       </div>
 
       <div
@@ -484,15 +491,11 @@ const CONTROL =
           {{ data.otherGroups.toLocaleString() }} more
           {{ data.otherGroups === 1 ? 'group' : 'groups' }} not shown.
         </span>
-        <span v-if="skipped.length > 0">
-          Hits left out: {{ skipped.join(', ') }}.
-        </span>
+        <span v-if="skipped.length > 0"> Hits left out: {{ skipped.join(', ') }}. </span>
         <span
           v-if="axisZone"
           class="ml-auto"
-        >
-          Times in {{ axisZone }}.
-        </span>
+        > Times in {{ axisZone }}. </span>
       </div>
     </div>
   </div>

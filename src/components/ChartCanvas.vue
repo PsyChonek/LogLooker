@@ -4,7 +4,7 @@ import type { ChartSeries } from '@/types';
 
 // Hand-rolled SVG so the chart follows the app's theme and needs no dependency.
 // Colours come from the --chart-N slots in style.css, assigned to series in a
-// fixed order and never cycled — the backend's top-N cut keeps it under eight.
+// fixed order and never cycled - the backend's top-N cut keeps it under eight.
 const MAX_SLOTS = 8;
 const ROW_HEIGHT = 26;
 const BAR_THICKNESS = 14;
@@ -92,7 +92,7 @@ const maxValue = computed(() => {
   return max;
 });
 
-/** 1, 2, 2.5, 5, 10 x a power of ten — the steps people read without effort. */
+/** 1, 2, 2.5, 5, 10 x a power of ten - the steps people read without effort. */
 function niceStep(raw: number): number {
   const power = Math.pow(10, Math.floor(Math.log10(raw)));
   for (const m of [1, 2, 2.5, 5, 10]) {
@@ -125,7 +125,7 @@ function bandCenter(index: number): number {
   return (props.horizontal ? margin.value.top : margin.value.left) + band.value * (index + 0.5);
 }
 
-/** Bar with rounded corners on the data end only — the baseline end stays square. */
+/** Bar with rounded corners on the data end only - the baseline end stays square. */
 function barPath(x: number, y: number, w: number, h: number, end: 'top' | 'right'): string {
   if (w <= 0 || h <= 0) return '';
   const r = Math.min(CORNER, end === 'top' ? Math.min(w / 2, h) : Math.min(h / 2, w));
@@ -224,7 +224,7 @@ const lines = computed<LinePath[]>(() => {
     props.labels.forEach((_, i) => {
       const value = s.values[i];
       if (value == null) {
-        // A gap, not a zero — the line breaks rather than dipping to the floor
+        // A gap, not a zero - the line breaks rather than dipping to the floor
         pen = false;
         return;
       }
@@ -288,7 +288,7 @@ function formatValue(value: number): string {
   if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (abs >= 10_000) return `${(value / 1000).toFixed(0)}k`;
   // Round, never truncate: a tick sitting at 12.5 must not print as "13".
-  // Trailing zeros go too — an axis reads 7.5, not 7.50.
+  // Trailing zeros go too - an axis reads 7.5, not 7.50.
   return Number(value.toFixed(2)).toLocaleString();
 }
 

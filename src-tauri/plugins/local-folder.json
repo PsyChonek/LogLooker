@@ -1,0 +1,63 @@
+{
+  "$schema": "https://raw.githubusercontent.com/PsyChonek/LogLooker/main/docs/pack.schema.json",
+  "id": "local-folder",
+  "name": "Local folder",
+  "version": "1.0.0",
+  "description": "Reads logs from a directory on this machine or a mounted share - no Azure and no credentials involved. Point a service at a folder and pick whether its file names carry dates.",
+
+  "environments": [{ "id": "local", "label": "LOCAL" }],
+
+  "source": { "type": "local-folder" },
+
+  "discovery": { "type": "none" },
+
+  "logLocations": [
+    {
+      "id": "dated-files",
+      "label": "Files with a date in the name",
+      "dir": ".",
+      "file": "(?i)^.*?(?<y>\\d{4})[-_.](?<m>\\d{2})[-_.](?<d>\\d{2}).*\\.(?:log|txt)$"
+    },
+    {
+      "id": "all-files",
+      "label": "Every .log/.txt file (undated)",
+      "dir": ".",
+      "file": "(?i)^.*\\.(?:log|txt)$",
+      "dated": false
+    }
+  ],
+
+  "timestamps": ["iso8601", "dotted-dmy", "us-mdy"],
+
+  "fields": [
+    {
+      "key": "level",
+      "label": "Level",
+      "regex": "\\b(?<v>TRACE|DEBUG|INFO|INFORMATION|WARN|WARNING|ERROR|FATAL|CRITICAL)\\b",
+      "type": "string"
+    },
+    {
+      "key": "durationMs",
+      "label": "Duration (ms)",
+      "gate": "ms",
+      "regex": " (?<v>\\d+(?:\\.\\d+)?)ms\\b",
+      "type": "number"
+    }
+  ],
+
+  "presets": [
+    { "name": "Errors", "query": "\\b(ERROR|FATAL|CRITICAL)\\b", "isRegex": true },
+    { "name": "Exceptions", "query": "Exception", "isRegex": false }
+  ],
+
+  "charts": [
+    { "name": "Hits over time", "mode": "timeline", "bucket": "auto", "groupBy": "none" },
+    {
+      "name": "By level",
+      "mode": "category",
+      "groupBy": "field:level",
+      "metric": "count",
+      "topN": 10
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 //! In-memory cache of the decompressed log text.
 //!
 //! It holds text, not compressed bytes. Caching the `.zst` files in RAM would
-//! only duplicate the OS page cache, which already keeps them there for free —
+//! only duplicate the OS page cache, which already keeps them there for free -
 //! measured, it is exactly as fast as reading them from disk.
 //!
 //! What the text buys is parallelism: a zstd stream can only be decoded from
@@ -10,7 +10,7 @@
 //! viewer without decompressing to a temp file first, is why this exists.
 //!
 //! `max_bytes` is a hard cap. Files that do not fit are streamed from disk as
-//! before, so a 10 GB selection searches fine under a 2 GB cap — it just does
+//! before, so a 10 GB selection searches fine under a 2 GB cap - it just does
 //! not get the parallel scan.
 
 use serde::Serialize;
@@ -21,17 +21,28 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 pub const DEFAULT_MAX_MB: u64 = 2048;
-/// Below the minimum the cache cannot hold a day of most services; above the
-/// maximum the number is a typo rather than an intent.
+/// Below the minimum the cache cannot hold a day of most services. 0 means
+/// unlimited; anything above the minimum is a custom cap taken as intended.
 pub const MIN_MAX_MB: u64 = 64;
-pub const MAX_MAX_MB: u64 = 65_536;
 
 pub fn clamp_max_mb(max_mb: u64) -> u64 {
-    max_mb.clamp(MIN_MAX_MB, MAX_MAX_MB)
+    match max_mb {
+        0 => 0,
+        mb => mb.max(MIN_MAX_MB),
+    }
+}
+
+/// 0 (unlimited) becomes a cap the arithmetic can compare against; real byte
+/// counts never approach it.
+fn max_mb_to_bytes(max_mb: u64) -> u64 {
+    match clamp_max_mb(max_mb) {
+        0 => u64::MAX,
+        mb => mb * 1024 * 1024,
+    }
 }
 
 /// Identifies the exact bytes on disk. A live file (today's log, Log.txt) grows
-/// between syncs and its `.zst` is rewritten or appended to — length and mtime
+/// between syncs and its `.zst` is rewritten or appended to - length and mtime
 /// then differ from what was cached and the entry is reloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Version {
@@ -51,7 +62,7 @@ struct Entry {
     version: Version,
     text: Arc<[u8]>,
     last_used: u64,
-    /// Search pass that last touched this entry — a pass never evicts what it
+    /// Search pass that last touched this entry - a pass never evicts what it
     /// has already loaded for itself
     last_pass: u64,
 }
@@ -94,7 +105,7 @@ struct Inner {
     enabled: bool,
     max_bytes: u64,
     used_bytes: u64,
-    /// Room taken by files being decompressed right now — they own their bytes
+    /// Room taken by files being decompressed right now - they own their bytes
     /// before they have them, so a concurrent load cannot claim the same room
     reserved_bytes: u64,
     /// Monotonic tick for LRU order
@@ -106,7 +117,7 @@ struct Inner {
 
 impl MemCache {
     pub fn new(enabled: bool, max_mb: u64) -> Self {
-        Self::with_max_bytes(enabled, clamp_max_mb(max_mb) * 1024 * 1024)
+        Self::with_max_bytes(enabled, max_mb_to_bytes(max_mb))
     }
 
     fn with_max_bytes(enabled: bool, max_bytes: u64) -> Self {
@@ -129,7 +140,7 @@ impl MemCache {
 
     /// Turning the cache off, or shrinking it, frees the memory right away.
     pub fn configure(&self, enabled: bool, max_mb: u64) -> Result<(), String> {
-        self.configure_bytes(enabled, clamp_max_mb(max_mb) * 1024 * 1024)
+        self.configure_bytes(enabled, max_mb_to_bytes(max_mb))
     }
 
     fn configure_bytes(&self, enabled: bool, max_bytes: u64) -> Result<(), String> {
@@ -161,7 +172,11 @@ impl MemCache {
         let inner = self.lock()?;
         Ok(MemCacheStats {
             enabled: inner.enabled,
-            max_bytes: inner.max_bytes,
+            // 0 stands for unlimited; u64::MAX would lose precision as a JS number
+            max_bytes: match inner.max_bytes {
+                u64::MAX => 0,
+                bytes => bytes,
+            },
             used_bytes: inner.used_bytes,
             files: inner.entries.len(),
         })
@@ -176,7 +191,7 @@ impl MemCache {
         }
     }
 
-    /// The text of a cached file if it is already held — never loads it.
+    /// The text of a cached file if it is already held - never loads it.
     /// Search uses this: loading a file costs a decompression that the scan
     /// would otherwise fold into its single streaming pass.
     pub fn get(&self, path: &Path) -> Result<Option<Arc<[u8]>>, String> {
@@ -206,7 +221,7 @@ impl MemCache {
             }
             // The room is taken before the file is decompressed into it, so two
             // files loading at once cannot both pass the check and then both
-            // allocate — which, at a gigabyte apiece, would overshoot the cap.
+            // allocate - which, at a gigabyte apiece, would overshoot the cap.
             if !inner.reserve(uncompressed) {
                 return Ok(None);
             }
@@ -229,7 +244,7 @@ impl MemCache {
     }
 }
 
-/// The manifest knows the log's size, so the buffer is allocated once — a `Vec`
+/// The manifest knows the log's size, so the buffer is allocated once - a `Vec`
 /// that grows by doubling into gigabytes spends most of its time copying itself.
 fn decompress(path: &Path, uncompressed: u64) -> Result<Vec<u8>, String> {
     let compressed =
@@ -262,7 +277,7 @@ impl Inner {
 
     /// Claims room for a file about to be decompressed. Fails when the file
     /// cannot fit even after evicting everything the running pass has not
-    /// pinned — the caller then streams it instead.
+    /// pinned - the caller then streams it instead.
     fn reserve(&mut self, bytes: u64) -> bool {
         let pinned: u64 = self
             .entries
@@ -306,7 +321,7 @@ impl Inner {
 
     /// Stores the text and hands back the shared copy. If it no longer fits (the
     /// manifest's size was optimistic, or another pass filled the cache while
-    /// this one decompressed), the caller still gets the text — it is simply not
+    /// this one decompressed), the caller still gets the text - it is simply not
     /// kept, so the cap holds.
     fn insert(&mut self, path: &Path, version: Version, text: Arc<[u8]>) -> Arc<[u8]> {
         self.remove(path);
@@ -530,8 +545,11 @@ mod tests {
 
     #[test]
     fn a_hand_edited_budget_is_clamped_into_range() {
-        assert_eq!(clamp_max_mb(0), MIN_MAX_MB);
-        assert_eq!(clamp_max_mb(1_000_000), MAX_MAX_MB);
+        assert_eq!(clamp_max_mb(0), 0);
+        assert_eq!(clamp_max_mb(1), MIN_MAX_MB);
+        assert_eq!(clamp_max_mb(1_000_000), 1_000_000);
         assert_eq!(clamp_max_mb(DEFAULT_MAX_MB), DEFAULT_MAX_MB);
+        assert_eq!(max_mb_to_bytes(0), u64::MAX);
+        assert_eq!(max_mb_to_bytes(DEFAULT_MAX_MB), DEFAULT_MAX_MB * 1024 * 1024);
     }
 }

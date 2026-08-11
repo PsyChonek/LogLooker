@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capability for the main window and the raw-view and chart windows",
   "windows": ["main", "raw-*", "chart-*"],
-  "permissions": ["core:default", "core:window:allow-close", "opener:default"]
+  "permissions": ["core:default", "core:window:allow-close", "opener:default", "dialog:allow-open", "dialog:allow-save"]
 }

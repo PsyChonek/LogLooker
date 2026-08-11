@@ -1,6 +1,6 @@
 use crate::cache;
 use crate::config::ServiceConfig;
-use crate::memcache::{MemCache, Source};
+use crate::memcache::MemCache;
 use crate::search::Matcher;
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 /// Where an open raw file reads its lines from.
 enum Backing {
-    /// The memory cache already holds the decompressed text — the viewer indexes
+    /// The memory cache already holds the decompressed text - the viewer indexes
     /// it in place, so opening costs neither a decompression nor a temp file.
     Memory(Arc<[u8]>),
     /// The zstd file has no random access, so it is decompressed once into a
@@ -48,7 +48,7 @@ impl OpenFile {
     }
 
     /// Lines `[offset, offset + limit)`, 0-based. A range past the end yields
-    /// fewer (or no) lines rather than an error — the viewer may overscan.
+    /// fewer (or no) lines rather than an error - the viewer may overscan.
     pub fn lines(&self, offset: usize, limit: usize) -> Result<Vec<String>, String> {
         let end = offset.saturating_add(limit).min(self.line_offsets.len());
         if offset >= end {
@@ -159,8 +159,8 @@ fn collect_match(
     }
 }
 
-/// Matched lines are only previews for the match list — the viewer shows the
-/// full line — so their text is capped to keep huge SQL/HTML lines off IPC.
+/// Matched lines are only previews for the match list - the viewer shows the
+/// full line - so their text is capped to keep huge SQL/HTML lines off IPC.
 const MATCH_TEXT_CHARS: usize = 500;
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,7 +182,7 @@ pub struct RawSearchResult {
 /// otherwise is it decompressed into a temp file.
 /// Blocking and CPU-bound; call via spawn_blocking.
 pub fn open(service: &ServiceConfig, file: &str, cache: &MemCache) -> Result<OpenFile, String> {
-    let dir = cache::service_dir_path(service.environment, &service.name)?;
+    let dir = cache::service_dir_path(&service.environment, &service.name)?;
     let local_name = format!("{file}.zst");
     let manifest = cache::load_manifest(&dir);
     let entry = manifest
@@ -193,7 +193,7 @@ pub fn open(service: &ServiceConfig, file: &str, cache: &MemCache) -> Result<Ope
 
     let path = dir.join(&local_name);
     // Held in memory, or small enough to hold: index it there. The temp file is
-    // only for logs too big for the budget — the one case where writing the text
+    // only for logs too big for the budget - the one case where writing the text
     // out beats keeping it.
     let (backing, line_offsets, size_bytes) = match cache.load(&path, entry.remote_size)? {
         Some(text) => {
@@ -309,7 +309,7 @@ mod tests {
         }
     }
 
-    /// The same file backed by the memory cache instead of a temp file — the
+    /// The same file backed by the memory cache instead of a temp file - the
     /// viewer must see exactly the same lines either way.
     fn open_in_memory(path: &Path) -> OpenFile {
         let text: Arc<[u8]> = Arc::from(std::fs::read(path).unwrap());

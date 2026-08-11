@@ -1,9 +1,11 @@
 [package]
 name = "log-looker"
 version = "0.1.0"
-description = "Fetch, cache and cross-search App Service logs from Kudu"
-authors = ["you"]
+description = "Fetch, cache and cross-search log files from pluggable sources"
+authors = ["Daniel Vazac"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/PsyChonek/LogLooker"
 
 [lib]
 name = "log_looker_lib"
@@ -15,10 +17,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 regex = "1"

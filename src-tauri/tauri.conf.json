@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LogLooker",
-  "version": "1.0.1",
-  "identifier": "cz.Example.loglooker",
+  "version": "1.1.11",
+  "identifier": "com.psychonek.loglooker",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -15,6 +15,7 @@
         "title": "LogLooker",
         "width": 1100,
         "height": 700,
+        "dragDropEnabled": false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msOverlayScrollbarWinStyle,msOverlayScrollbarWinStyleAnimation"
       }
     ],
@@ -25,6 +26,8 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "PsyChonek",
+    "shortDescription": "Fetch, cache and cross-search log files from many services at once.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

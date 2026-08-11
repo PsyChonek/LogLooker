@@ -139,7 +139,7 @@
  * Chart palette
  *
  * The eight categorical slots are assigned to series in this fixed order and
- * never cycled — a ninth group is folded away by the backend's top-N cut, not
+ * never cycled - a ninth group is folded away by the backend's top-N cut, not
  * given an invented hue. The hues are identity, so they do not follow the
  * theme; only the chrome (grid, axis) does. The dark column is the same eight
  * hues stepped for the dark surface. Both sets are validated for colorblind
