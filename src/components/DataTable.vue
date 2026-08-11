@@ -174,6 +174,21 @@ function widthFor(col: DataTableColumn): number | undefined {
   return base == null ? floor : Math.max(base, floor);
 }
 
+// Fixed table layout hands a width-less column whatever space the sized columns
+// leave over, and that is nothing once they fill the table: the column collapses
+// to zero width and its content wraps one character per line, so a single row
+// grows taller than the screen. Flooring the table's width makes the sized
+// columns push the table into horizontal scroll instead, and every flexible
+// column keeps a usable width.
+const FLEX_MIN_WIDTH = 320;
+
+const tableMinWidth = computed(() =>
+  visibleColumns.value.reduce(
+    (sum, col) => sum + (widthFor(col) ?? Math.max(col.minWidth ?? 0, FLEX_MIN_WIDTH)),
+    0,
+  ),
+);
+
 function alignClass(col: DataTableColumn): string {
   if (col.align === 'right') return 'text-right';
   if (col.align === 'center') return 'text-center';
@@ -444,6 +459,13 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', onDocumentKeydown);
   document.removeEventListener('scroll', onAnyScroll, true);
 });
+
+// Paged views call this after a page change so the new page starts at the top
+function scrollToTop() {
+  scrollRef.value?.scrollTo({ top: 0 });
+}
+
+defineExpose({ scrollToTop });
 </script>
 
 <template>
@@ -462,7 +484,7 @@ onBeforeUnmount(() => {
       <table
         class="w-full border-separate border-spacing-0 text-xs"
         :class="tableClass"
-        style="table-layout: fixed"
+        :style="{ tableLayout: 'fixed', minWidth: `${tableMinWidth}px` }"
       >
         <colgroup>
           <col

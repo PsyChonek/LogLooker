@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import BaseCheckbox from '@/components/BaseCheckbox.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import DataTable, { type DataTableColumn, type SortState } from '@/components/DataTable.vue';
 import RawFileViewer from '@/components/RawFileViewer.vue';
+import TablePagination from '@/components/TablePagination.vue';
+import { usePagination } from '@/composables/usePagination';
 import { formatBytes, useAppStore } from '@/stores/appStore';
 import { sortRows, type SortAccessor } from '@/utils/tableSort';
 import type { CachedFileInfo } from '@/types';
@@ -67,6 +69,24 @@ const sortAccessors: Record<string, SortAccessor<CachedFileInfo>> = {
 };
 
 const sortedFiles = computed(() => sortRows(visibleFiles.value, sort.value, sortAccessors));
+
+// A cache with thousands of files renders thousands of rows, which makes the
+// whole page crawl, so only one page of rows is handed to the table
+const table = ref<{ scrollToTop: () => void } | null>(null);
+const {
+  page,
+  pageSize,
+  setPageSize,
+  pageCount,
+  total,
+  start,
+  pagedRows: pagedFiles,
+  reset,
+} = usePagination(sortedFiles, { storageKey: 'files' });
+
+// A different filter, scope or sort order makes the current page meaningless
+watch([filter, selectedOnly, sort], reset);
+watch(page, () => table.value?.scrollToTop());
 
 async function load() {
   loading.value = true;
@@ -227,13 +247,14 @@ onMounted(load);
       class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden"
     >
       <DataTable
+        ref="table"
         v-model:sort="sort"
         table-id="files"
         :columns="columns"
-        :rows="sortedFiles"
+        :rows="pagedFiles"
         :row-key="(file) => `${file.serviceId}:${file.file}`"
         table-class="min-w-[56rem] font-mono"
-        scroll-class="max-h-[calc(100vh-220px)]"
+        scroll-class="max-h-[calc(100vh-260px)]"
         :loading="loading"
         clickable-rows
         @row-click="(file) => (opened = file)"
@@ -301,6 +322,17 @@ onMounted(load);
           No cached files. Select services and a date range on the Services page and sync.
         </template>
       </DataTable>
+
+      <TablePagination
+        v-if="total > 0"
+        v-model:page="page"
+        :page-count="pageCount"
+        :page-size="pageSize"
+        :total="total"
+        :start="start"
+        label="files"
+        @update:page-size="setPageSize"
+      />
     </div>
 
     <RawFileViewer
