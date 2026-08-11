@@ -22,9 +22,12 @@ import { useAppStore } from '@/stores/appStore';
 import {
   buildExtractorParts,
   buildHighlighter,
+  paletteSlot,
+  parseQuery,
   partClass,
   partStyle,
   type HighlightPart,
+  type QuerySet,
 } from '@/utils/regexQuery';
 import type {
   ExportRequest,
@@ -154,7 +157,7 @@ const serviceNames = computed(() =>
 // Per hit, not per table: a merged result may span services on different log clocks,
 // and each row then has to say which one it is read on. Recomputes on the toggle.
 const times = computed(() =>
-  hits.value.map((hit) => formatLogTime(hit.timestamp, store.logOffset(hit.serviceId))),
+  visibleHits.value.map((hit) => formatLogTime(hit.timestamp, store.logOffset(hit.serviceId))),
 );
 
 const allQueries = computed(() => [...presets.value, ...store.config.savedQueries]);
@@ -173,10 +176,14 @@ function pickSavedQuery(index: string) {
 }
 
 function applyQuery(saved: SavedQuery) {
-  // The builder owns the query field while open; a saved query is a plain one
-  showBuilder.value = false;
   query.value = saved.query;
   isRegex.value = saved.isRegex;
+  // A query the builder wrote loads back into it, so picking a saved query
+  // while the builder is open shows its criteria. One the builder cannot read
+  // is a plain query, and the builder steps out of the way rather than sit
+  // there showing criteria that have nothing to do with the field.
+  if (showBuilder.value && saved.isRegex && parseQuery(saved.query)) builderReload.value++;
+  else showBuilder.value = false;
 }
 
 // --- Query builder ---
@@ -184,15 +191,32 @@ function applyQuery(saved: SavedQuery) {
 const BUILDER_OPEN_KEY = 'loglooker.queryBuilderOpen';
 const showBuilder = ref(localStorage.getItem(BUILDER_OPEN_KEY) === '1');
 
+// The builder reads the query field once, when it mounts. Bumping this remounts
+// it so it reads the field again - only when a saved query is applied over it,
+// never on the edits it makes itself.
+const builderReload = ref(0);
+
+// What the builder may read back as its criteria. A field in literal mode holds
+// text, not a pattern the builder could have written, whatever it looks like.
+const builderSource = computed(() => (isRegex.value ? query.value : ''));
+
 watch(showBuilder, (open) => {
   localStorage.setItem(BUILDER_OPEN_KEY, open ? '1' : '0');
 });
 
 // The builder compiles its criteria to a plain regex; closing it leaves the
-// compiled pattern in the field, free to be edited by hand
-function onCompiled(compiled: string) {
+// compiled pattern in the field, free to be edited by hand. Its groups come
+// along as sets, since the pattern alone does not say which capture groups
+// belong together - they outlive the builder being closed, and only apply
+// while the field still holds the pattern they describe.
+const builderQuery = ref('');
+const builderSets = ref<QuerySet[]>([]);
+
+function onCompiled(compiled: string, sets: QuerySet[]) {
   query.value = compiled;
   isRegex.value = true;
+  builderQuery.value = compiled;
+  builderSets.value = sets;
 }
 
 // Store the current query under `name`, overwriting an existing saved query of
@@ -345,6 +369,9 @@ async function runSearch(
     expanded.value = new Set();
     sort.value = { key: 'time', ascending: false };
     searchedQuery.value = submittedQuery;
+    // A hand-edited query no longer matches the builder tree, so its sets
+    // would name capture groups that need not exist any more
+    searchedSets.value = submittedQuery === builderQuery.value ? builderSets.value : [];
     searchedIsRegex.value = submittedIsRegex;
     searchedCaseSensitive.value = submittedCaseSensitive;
     searchedTimeFrom.value = submittedTimeFrom;
@@ -352,7 +379,7 @@ async function runSearch(
     searchedPreview.value = preview;
     searchedDateFrom.value = store.dateFrom;
     searchedDateTo.value = store.dateTo;
-    await loadMore();
+    await fillVisibleRows();
   } catch (e) {
     if (String(e) === 'Search cancelled') {
       // The backend freed the previous result when this search started, so
@@ -392,6 +419,24 @@ async function loadMore() {
     error.value = String(e);
   } finally {
     loadingMore.value = false;
+  }
+}
+
+// Switching a group off can hide most of a loaded page, leaving too few rows to
+// scroll - and scrolling is what pages the rest in. Keep pulling until enough
+// rows survive the filter, or the result runs out.
+const MIN_VISIBLE_ROWS = 100;
+
+async function fillVisibleRows() {
+  while (
+    meta.value &&
+    visibleHits.value.length < MIN_VISIBLE_ROWS &&
+    hits.value.length < meta.value.totalHits
+  ) {
+    const before = hits.value.length;
+    await loadMore();
+    // No progress means another load is already running or one failed
+    if (hits.value.length === before) return;
   }
 }
 
@@ -436,7 +481,11 @@ const baseColumns: DataTableColumn[] = [
     key: 'line',
     label: 'Line',
     sortable: true,
-    cellClass: 'text-gray-700 dark:text-gray-300 break-all',
+    // break-words, not break-all: a wrapped log line stays readable when words
+    // survive the wrap, and an unbreakable token (a URL, a stack frame) still
+    // splits because it cannot fit a line on its own. Relaxed leading keeps the
+    // wrapped lines apart.
+    cellClass: 'text-gray-800 dark:text-gray-200 break-words leading-relaxed',
   },
 ];
 
@@ -488,7 +537,7 @@ async function onSort(next: SortState) {
     await invoke('sort_search_hits', { field: sortFieldOf(next.key), ascending: next.ascending });
     expanded.value = new Set();
     hits.value = [];
-    await loadMore();
+    await fillVisibleRows();
   } catch (e) {
     error.value = String(e);
   }
@@ -546,6 +595,46 @@ function toggleGroup(name: string) {
   else next.add(name);
   disabledGroups.value = next;
 }
+
+// The builder groups behind the searched query, so a whole set can be switched
+// off at once instead of clicking its criteria one by one
+const searchedSets = ref<QuerySet[]>([]);
+
+function setIsOff(names: string[]): boolean {
+  return names.every((name) => disabledGroups.value.has(name));
+}
+
+// Off unless the whole set is already off - a half-on set switches fully off
+// first, which is what the single visible state of the chip promises
+function toggleSet(names: string[]) {
+  const next = new Set(disabledGroups.value);
+  const turnOff = !setIsOff(names);
+  for (const name of names) {
+    if (turnOff) next.add(name);
+    else next.delete(name);
+  }
+  disabledGroups.value = next;
+}
+
+// A hit whose every matched group is switched off carries no highlight left, so
+// it drops out of the table entirely - the same rows Copy and Export leave out.
+// Hits from a query without named groups always stay.
+const visibleHits = computed(() => {
+  const off = disabledGroups.value;
+  if (off.size === 0) return hits.value;
+  return hits.value.filter(
+    (hit) => hit.matchedGroups.length === 0 || hit.matchedGroups.some((name) => !off.has(name)),
+  );
+});
+
+const hiddenHits = computed(() => hits.value.length - visibleHits.value.length);
+
+// Rows are expanded by index into the rendered list, and hiding groups shifts
+// every index below the first hidden hit - re-loading keeps rows in sync
+watch(disabledGroups, () => {
+  expanded.value = new Set();
+  fillVisibleRows();
+});
 
 watch(
   () => meta.value?.groupNames,
@@ -764,8 +853,18 @@ async function exportToFile() {
 
 // Colour legend for the searched query's capture groups, shown above the results
 const groupChips = computed(() =>
-  (meta.value?.groupNames ?? []).map((name, i) => ({ name, slot: (i % 8) + 1 })),
+  (meta.value?.groupNames ?? []).map((name, i) => ({ name, slot: paletteSlot(i + 1) })),
 );
+
+// Set chips sit next to them and toggle every group of one builder set. Sets
+// are pruned to the capture groups this result actually has; a set down to a
+// single group would duplicate that group's own chip, so it is left out.
+const setChips = computed(() => {
+  const live = new Set(meta.value?.groupNames ?? []);
+  return searchedSets.value
+    .map((set) => ({ ...set, names: set.names.filter((name) => live.has(name)) }))
+    .filter((set) => set.names.length > 1);
+});
 
 const progressText = computed(() => {
   const p = progress.value;
@@ -1060,7 +1159,13 @@ onUnmounted(() => {
       </div>
     </Teleport>
 
-    <QueryBuilder v-if="showBuilder" @compiled="onCompiled" @search="search()" />
+    <QueryBuilder
+      v-if="showBuilder"
+      :key="builderReload"
+      :query="builderSource"
+      @compiled="onCompiled"
+      @search="search()"
+    />
 
     <div
       v-if="dateRangeStale"
@@ -1128,8 +1233,8 @@ onUnmounted(() => {
         :class="disabledGroups.has(chip.name) ? 'opacity-40' : ''"
         :title="
           disabledGroups.has(chip.name)
-            ? `Group '${chip.name}' is off - click to highlight it and include it in Extract match`
-            : `Group '${chip.name}' - click to stop highlighting it and leave it out of Extract match`
+            ? `Group '${chip.name}' is off - click to highlight it again, bring back the lines only it matched, and include it in Extract match`
+            : `Group '${chip.name}' - click to stop highlighting it, hide the lines only it matched, and leave it out of Extract match`
         "
         @click="toggleGroup(chip.name)"
       >
@@ -1148,8 +1253,29 @@ onUnmounted(() => {
           >{{ chip.name }}</span
         >
       </button>
+      <button
+        v-for="set in setChips"
+        :key="`set-${set.label}`"
+        type="button"
+        class="flex items-center gap-1.5 rounded-full border px-2 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700/50"
+        :class="setIsOff(set.names) ? 'opacity-40' : ''"
+        :style="{ borderColor: `var(--chart-${set.slot})` }"
+        :title="
+          setIsOff(set.names)
+            ? `Set '${set.label}' is off - click to highlight its ${set.names.length} groups and include them in Extract match`
+            : `Set '${set.label}' (${set.names.join(', ')}) - click to switch the whole set off, leaving it out of highlights and Extract match`
+        "
+        @click="toggleSet(set.names)"
+      >
+        <span class="truncate max-w-[10rem]" :class="setIsOff(set.names) ? 'line-through' : ''">{{
+          set.label
+        }}</span>
+      </button>
+      <span v-if="tab === 'table' && hiddenHits > 0" class="text-gray-500 dark:text-gray-400">
+        {{ hiddenHits.toLocaleString() }} hidden - only groups that are switched off matched
+      </span>
       <span v-if="tab === 'table' && hits.length < meta.totalHits">
-        showing {{ hits.length.toLocaleString() }} (scroll to load more)
+        showing {{ visibleHits.length.toLocaleString() }} (scroll to load more)
       </span>
 
       <BaseCheckbox
@@ -1225,7 +1351,7 @@ onUnmounted(() => {
         <DataTable
           table-id="search"
           :columns="columns"
-          :rows="hits"
+          :rows="visibleHits"
           table-class="min-w-[48rem] font-mono"
           scroll-class="max-h-[calc(100vh-260px)]"
           clickable-rows
@@ -1238,14 +1364,17 @@ onUnmounted(() => {
           @scroll="onResultsScroll"
         >
           <template #time="{ index }">
-            {{ times[index].text }}
-            <span v-if="times[index].zone" class="text-gray-400 dark:text-gray-500"
-              >({{ times[index].zone }})</span
-            >
+            <span :title="times[index].text + (times[index].zone ? ` (${times[index].zone})` : '')">
+              {{ times[index].text }}
+              <span v-if="times[index].zone" class="text-gray-400 dark:text-gray-500"
+                >({{ times[index].zone }})</span
+              >
+            </span>
           </template>
           <template #service="{ row: hit }">
             <span
               class="inline-block px-1.5 py-0.5 text-[10px] font-semibold rounded"
+              :title="serviceNames[hit.serviceId] ?? hit.serviceId"
               :class="
                 hit.serviceId.startsWith('production/')
                   ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
@@ -1268,16 +1397,14 @@ onUnmounted(() => {
           <template #line="{ row: hit }">
             <div :class="singleRow ? 'flex items-baseline gap-1' : ''">
               <span :class="singleRow ? 'min-w-0 truncate' : ''">
-                <template v-for="(part, p) in displayParts(hit)" :key="p">
-                  <span
-                    v-if="part.slot !== null"
-                    :class="partClass(part)"
-                    :style="partStyle(part)"
-                    >{{ part.text }}</span
-                  ><template v-else>
-                    {{ part.text }}
-                  </template>
-                </template>
+                <!-- No whitespace between the parts: Vue condenses the newlines
+                     of a formatted template into real spaces, which would pad
+                     every highlight and print a line the log never contained -->
+                <template v-for="(part, p) in displayParts(hit)" :key="p"><span
+                  v-if="part.slot !== null"
+                  :class="partClass(part)"
+                  :style="partStyle(part)"
+                >{{ part.text }}</span><template v-else>{{ part.text }}</template></template>
               </span>
               <button
                 class="text-gray-400 text-[10px] whitespace-nowrap hover:text-blue-500 hover:underline"
@@ -1292,7 +1419,7 @@ onUnmounted(() => {
           <template #expansion="{ row: hit }">
             <div class="px-3 py-2 bg-gray-50 dark:bg-gray-900/50">
               <pre
-                class="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed"
+                class="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed"
               ><span class="text-gray-400">{{ hit.contextBefore.join('\n') }}</span>
   <span class="text-gray-900 dark:text-gray-100 font-semibold"><template
     v-for="(part, p) in lineParts(hit)"

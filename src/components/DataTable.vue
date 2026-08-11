@@ -649,8 +649,10 @@ defineExpose({ scrollToTop });
                 ]"
               >
                 <!-- Clip on an inner wrapper, not the cell; auto-fit also measures
-                     this wrapper's scrollWidth -->
-                <div class="overflow-hidden">
+                     this wrapper's scrollWidth. text-ellipsis marks the cut for a
+                     non-wrapping cell, so narrow columns lose text visibly instead
+                     of silently slicing it off at the right edge -->
+                <div class="overflow-hidden text-ellipsis">
                   <slot
                     :name="col.key"
                     :row="row"
