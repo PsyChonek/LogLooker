@@ -71,6 +71,7 @@ pub fn run() {
             clear_logs,
             commands::get_config,
             commands::update_config,
+            commands::open_config_dir,
             commands::get_preset_queries,
             commands::add_environment,
             commands::remove_environment,

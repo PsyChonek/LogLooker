@@ -32,6 +32,15 @@ pub fn update_config(
     cache.configure(settings.enabled, settings.max_mb)
 }
 
+/// Opens the directory containing config.json and other user-owned app files.
+#[tauri::command]
+pub fn open_config_dir(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = config::config_dir()?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("Cannot open settings folder: {e}"))
+}
+
 /// Adds an environment of the user's own, named however they like. Environments
 /// are not a plugin's property: a service of any plugin can be put in any of
 /// them. Returns the user-created list, the packs' own being fixed.

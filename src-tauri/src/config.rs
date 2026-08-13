@@ -307,12 +307,16 @@ pub fn validate_service_name(name: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn config_path() -> Result<PathBuf, String> {
+pub fn config_dir() -> Result<PathBuf, String> {
     let dir = dirs::config_dir()
         .ok_or("Cannot resolve config directory")?
         .join("LogLooker");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create config dir: {e}"))?;
-    Ok(dir.join("config.json"))
+    Ok(dir)
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    Ok(config_dir()?.join("config.json"))
 }
 
 /// Reads config without touching packs - the pack registry itself is built from

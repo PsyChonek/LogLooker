@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import MemoryCacheSettings from '@/components/MemoryCacheSettings.vue';
+import SettingsMenu from '@/components/SettingsMenu.vue';
 import ThemeSelector from '@/components/ThemeSelector.vue';
 import TimeModeSelector from '@/components/TimeModeSelector.vue';
 
@@ -32,6 +33,7 @@ const emit = defineEmits<{
         <TimeModeSelector />
         <MemoryCacheSettings />
         <ThemeSelector />
+        <SettingsMenu />
       </div>
     </div>
   </header>
