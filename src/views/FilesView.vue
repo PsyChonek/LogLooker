@@ -19,7 +19,15 @@ const columns: DataTableColumn[] = [
   { key: 'instance', label: 'Instance', width: 160, sortable: true },
   { key: 'size', label: 'Size', width: 112, align: 'right', sortable: true, numeric: true },
   { key: 'cached', label: 'Cached', width: 96, align: 'right', sortable: true, numeric: true },
-  { key: 'actions', label: '', width: 232, align: 'right', reorderable: false, hideable: false },
+  {
+    key: 'actions',
+    label: '',
+    width: 232,
+    align: 'right',
+    reorderable: false,
+    resizable: false,
+    hideable: false,
+  },
 ];
 
 const store = useAppStore();
