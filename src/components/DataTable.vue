@@ -41,6 +41,7 @@ interface TableLayout {
 <script setup lang="ts" generic="TRow">
 import { computed, onBeforeUnmount, onMounted, onUpdated, ref, watch } from 'vue';
 import { useColumnResize } from '@/composables/useColumnResize';
+import { canResizeRightBoundary } from '@/utils/tableResize';
 import BaseCheckbox from '@/components/BaseCheckbox.vue';
 import Spinner from '@/components/Spinner.vue';
 
@@ -587,10 +588,10 @@ defineExpose({ scrollToTop });
               <!-- Hit area for resizing; the always-visible line is the cell's border-r,
                    so the handle only paints a blue highlight over it on hover/drag.
                    It straddles the border (half in the next cell) so both sides of
-                   the line are grabbable; the last column stays inside to avoid
-                   widening the scroll area -->
+                   the line are grabbable. A fixed next column disables this boundary,
+                   and the last column stays inside to avoid widening the scroll area -->
               <span
-                v-if="col.resizable !== false"
+                v-if="canResizeRightBoundary(visibleColumns, colIndex)"
                 class="group absolute top-0 z-10 flex h-full w-2.5 cursor-col-resize items-stretch"
                 :class="
                   colIndex < visibleColumns.length - 1

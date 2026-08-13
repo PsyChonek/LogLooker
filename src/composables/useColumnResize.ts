@@ -1,4 +1,5 @@
 import { onBeforeUnmount, ref } from 'vue';
+import { widthFromPointerDelta } from '@/utils/tableResize';
 
 // Drag-to-resize for table column headers. A view (or DataTable) renders a small
 // handle on the right edge of each header cell and forwards its mousedown here;
@@ -24,13 +25,7 @@ export function useColumnResize(options: ColumnResizeOptions) {
   function onMove(event: MouseEvent) {
     const key = resizingKey.value;
     if (!key) return;
-    // Measure from the header's live left edge rather than accumulating a delta:
-    // with table-layout: fixed and a percentage table width the browser may
-    // redistribute space, so the rendered width can drift from the width we set
-    const next = header
-      ? event.clientX - header.getBoundingClientRect().left
-      : startWidth + (event.clientX - startX);
-    options.setWidth(key, Math.round(Math.max(floor(key), next)));
+    options.setWidth(key, widthFromPointerDelta(startWidth, startX, event.clientX, floor(key)));
   }
 
   function stop() {
