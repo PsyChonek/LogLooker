@@ -41,7 +41,7 @@ pub fn set_memory_cache(
 }
 
 #[tauri::command]
-pub fn clear_memory_cache(cache: tauri::State<'_, MemCache>) -> Result<MemCacheStats, String> {
+pub fn clear_memory_cache(cache: tauri::State<'_, Arc<MemCache>>) -> Result<MemCacheStats, String> {
     cache.clear()?;
     cache.stats()
 }
