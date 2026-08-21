@@ -6,7 +6,6 @@ import {
   groupSlots,
   isNegated,
   paletteSlot,
-  parseQuery,
   querySets,
   type CriterionMode,
   type CriterionNode,
@@ -14,6 +13,7 @@ import {
   type QuerySet,
   type QueryNode,
 } from '@/utils/regexQuery';
+import { builderOpenAction } from '@/utils/queryBuilderState';
 import QueryGroup from './QueryGroup.vue';
 import { builderContextKey } from './queryBuilderContext';
 
@@ -252,12 +252,10 @@ watch(
 // until a criterion gives the builder something to say - emitting an empty
 // pattern here used to wipe the query the user had just loaded.
 onMounted(() => {
-  const parsed = compiled.value === props.query ? null : parseQuery(props.query);
-  if (parsed) {
+  const action = builderOpenAction(root.value, props.query);
+  if (action.kind === 'replace') {
     // The deep watch persists the tree and hands the recompiled pattern back
-    root.value = parsed;
-  } else if (compiled.value) {
-    emit('compiled', compiled.value, querySets(root.value));
+    root.value = action.root;
   }
 });
 </script>
