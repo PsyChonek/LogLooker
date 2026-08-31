@@ -32,8 +32,12 @@ pub async fn detect(source: &LogSource, pack: &Pack) -> Result<Option<String>, S
     for location in &pack.locations {
         // A directory that is missing (or forbidden) is simply not this service's
         // location - only a match decides, so listing errors are not fatal here.
-        let Ok(entries) = source.list_dir(&location.dir).await else {
-            continue;
+        let entries = match source.list_dir(&location.dir).await {
+            Ok(entries) => entries,
+            // An expired or revoked token is not evidence that this particular
+            // location is absent. Surface it so sync can refresh and retry.
+            Err(error) if crate::auth::is_access_denied(&error) => return Err(error),
+            Err(_) => continue,
         };
         if entries
             .iter()
@@ -156,7 +160,10 @@ mod tests {
             ],
         );
         // applogs exists but holds nothing the location matches, so probing goes on
-        assert_eq!(detect(&source, &pack()).await.unwrap().as_deref(), Some("docker"));
+        assert_eq!(
+            detect(&source, &pack()).await.unwrap().as_deref(),
+            Some("docker")
+        );
     }
 
     #[tokio::test]
@@ -180,11 +187,17 @@ mod tests {
         let pack = pack();
         let location = pack.location("core-applogs").unwrap();
 
-        let files = list_files(&source, location, day(13), day(14)).await.unwrap();
+        let files = list_files(&source, location, day(13), day(14))
+            .await
+            .unwrap();
         let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["log-2026-07-13.log", "log-2026-07-14.log", "log-2026-07-14_18.log"]
+            vec![
+                "log-2026-07-13.log",
+                "log-2026-07-14.log",
+                "log-2026-07-14_18.log"
+            ]
         );
         assert_eq!(files[0].date, Some(day(13)));
         assert_eq!(files[0].vfs_path, "applogs/log-2026-07-13.log");

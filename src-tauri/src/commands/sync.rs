@@ -1,4 +1,4 @@
-use crate::auth::TokenState;
+use crate::auth::{self, TokenState};
 use crate::cache::{self, CacheStatus, SyncSummary};
 use crate::config::{ConfigState, ServiceConfig};
 use crate::locations;
@@ -43,6 +43,60 @@ pub(crate) async fn sync_one(
     date_to: NaiveDate,
     cancel: &AtomicBool,
 ) -> Result<SyncSummary, String> {
+    let first = sync_one_attempt(
+        app,
+        config_state,
+        plugin_state,
+        token_state,
+        service,
+        date_from,
+        date_to,
+        cancel,
+    )
+    .await;
+    if !should_refresh_token(&first) || cancel.load(Ordering::Relaxed) {
+        return first;
+    }
+
+    // A token may be revoked before its advertised expiry. Clear it and repeat
+    // the whole service once so the user does not have to run Sync or Download
+    // a second time. Sync is resumable, so files completed by the first attempt
+    // are safely skipped by the retry.
+    auth::invalidate_token(token_state);
+    sync_one_attempt(
+        app,
+        config_state,
+        plugin_state,
+        token_state,
+        service,
+        date_from,
+        date_to,
+        cancel,
+    )
+    .await
+}
+
+fn should_refresh_token(result: &Result<SyncSummary, String>) -> bool {
+    match result {
+        Err(error) => auth::is_access_denied(error),
+        Ok(summary) => summary
+            .warnings
+            .iter()
+            .any(|warning| auth::is_access_denied(warning)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_one_attempt(
+    app: &tauri::AppHandle,
+    config_state: &tauri::State<'_, ConfigState>,
+    plugin_state: &tauri::State<'_, PluginState>,
+    token_state: &tauri::State<'_, TokenState>,
+    service: &ServiceConfig,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+    cancel: &AtomicBool,
+) -> Result<SyncSummary, String> {
     let id = &service.id;
     let registry = plugin_state.snapshot();
     let pack = registry.pack(&service.pack_id).cloned().ok_or_else(|| {
@@ -56,14 +110,12 @@ pub(crate) async fn sync_one(
     let location_id = match &service.location {
         Some(id) => id.clone(),
         None => {
-            let detected = locations::detect(&source, &pack)
-                .await?
-                .ok_or_else(|| {
-                    format!(
-                        "{id}: none of {}'s log locations matched - set one in the services table",
-                        pack.manifest.name
-                    )
-                })?;
+            let detected = locations::detect(&source, &pack).await?.ok_or_else(|| {
+                format!(
+                    "{id}: none of {}'s log locations matched - set one in the services table",
+                    pack.manifest.name
+                )
+            })?;
             let mut guard = config_state.0.lock().map_err(|e| e.to_string())?;
             if let Some(entry) = guard.services.iter_mut().find(|s| &s.id == id) {
                 entry.location = Some(detected.clone());
@@ -80,20 +132,28 @@ pub(crate) async fn sync_one(
     })?;
 
     let mut last_emitted: u64 = 0;
-    cache::sync_service(&source, service, location, date_from, date_to, cancel, |p| {
-        let boundary = p.bytes_downloaded / 524_288;
-        if p.state != "downloading" || boundary > last_emitted {
-            last_emitted = boundary;
-            app.emit("sync-progress", &p).ok();
-        }
-        // The manifest is saved before "done"/"skipped" is reported, so the
-        // status is already up to date for this file
-        if p.state != "downloading" {
-            if let Ok(status) = cache::cache_status(service) {
-                app.emit("cache-status", &status).ok();
+    cache::sync_service(
+        &source,
+        service,
+        location,
+        date_from,
+        date_to,
+        cancel,
+        |p| {
+            let boundary = p.bytes_downloaded / 524_288;
+            if p.state != "downloading" || boundary > last_emitted {
+                last_emitted = boundary;
+                app.emit("sync-progress", &p).ok();
             }
-        }
-    })
+            // The manifest is saved before "done"/"skipped" is reported, so the
+            // status is already up to date for this file
+            if p.state != "downloading" {
+                if let Ok(status) = cache::cache_status(service) {
+                    app.emit("cache-status", &status).ok();
+                }
+            }
+        },
+    )
     .await
 }
 
@@ -198,4 +258,47 @@ pub fn cache_status_all(
 ) -> Result<Vec<CacheStatus>, String> {
     let guard = config_state.0.lock().map_err(|e| e.to_string())?;
     guard.services.iter().map(cache::cache_status).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(warnings: &[&str]) -> SyncSummary {
+        SyncSummary {
+            service_id: "test/public-api".into(),
+            files_total: 1,
+            files_downloaded: 0,
+            files_skipped: 0,
+            files_failed: warnings.len(),
+            bytes_downloaded: 0,
+            warnings: warnings.iter().map(|warning| warning.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn refreshes_token_when_the_directory_listing_is_denied() {
+        let result =
+            Err("Access denied (401 Unauthorized) for https://app.scm/api/vfs/applogs/".into());
+
+        assert!(should_refresh_token(&result));
+    }
+
+    #[test]
+    fn refreshes_token_when_a_file_download_is_denied() {
+        let result = Ok(summary(&[
+            "log-2026-08-31.log: download failed - Access denied (401 Unauthorized) for https://app.scm/api/vfs/applogs/log-2026-08-31.log",
+        ]));
+
+        assert!(should_refresh_token(&result));
+    }
+
+    #[test]
+    fn does_not_refresh_token_for_unrelated_failures() {
+        let result = Ok(summary(&[
+            "log-2026-08-31.log: download failed - connection reset",
+        ]));
+
+        assert!(!should_refresh_token(&result));
+    }
 }

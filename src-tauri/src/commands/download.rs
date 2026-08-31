@@ -1,3 +1,4 @@
+use super::sync::SyncCancel;
 use crate::auth::TokenState;
 use crate::cache;
 use crate::config::ConfigState;
@@ -8,7 +9,6 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use super::sync::SyncCancel;
 
 /// Result of downloading one service to a chosen folder: the sync counts (what
 /// was fetched from Kudu, or skipped as already cached) plus the export counts
@@ -93,8 +93,14 @@ pub async fn download_services(
                 .await
                 .map_err(|e| format!("Export task failed: {e}"))??
             };
+            let no_remote_files = sync.files_total == 0;
             let mut warnings = sync.warnings;
             warnings.extend(export.warnings);
+            if no_remote_files && export.files_written == 0 {
+                warnings.push(format!(
+                    "No log files matched {date_from} through {date_to}"
+                ));
+            }
             Ok(DownloadSummary {
                 service_id: id.clone(),
                 files_downloaded: sync.files_downloaded,

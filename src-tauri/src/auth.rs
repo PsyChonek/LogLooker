@@ -15,6 +15,22 @@ pub struct CachedToken {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Drops the cached bearer token after Kudu rejects it. Token expiry is checked
+/// before each use, but Azure can revoke a token before its advertised expiry
+/// after a long idle period or an account/subscription change.
+pub fn invalidate_token(state: &TokenState) {
+    if let Ok(mut guard) = state.0.lock() {
+        *guard = None;
+    }
+}
+
+/// Kudu uses this stable leading phrase for both 401 and 403 responses. Keep
+/// the check here so retry behavior and the UI agree on what an access failure
+/// is without depending on the rest of the human-readable message.
+pub fn is_access_denied(message: &str) -> bool {
+    message.contains("Access denied (")
+}
+
 #[derive(Deserialize)]
 struct AzTokenResponse {
     #[serde(rename = "accessToken")]
@@ -115,9 +131,11 @@ fn parse_expiry(parsed: &AzTokenResponse) -> Option<DateTime<Utc>> {
     }
     // Older az versions only emit a naive local timestamp like "2026-07-14 12:34:56.000000"
     let local = parsed.expires_on_local.as_deref()?;
-    let naive =
-        chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%d %H:%M:%S%.f").ok()?;
-    naive.and_local_timezone(chrono::Local).single().map(|dt| dt.with_timezone(&Utc))
+    let naive = chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%d %H:%M:%S%.f").ok()?;
+    naive
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn az_command() -> tokio::process::Command {
