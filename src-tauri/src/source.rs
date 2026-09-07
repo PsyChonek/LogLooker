@@ -37,9 +37,10 @@ impl LogSource {
                 let token = token.ok_or("A Kudu source needs an Azure access token")?;
                 Ok(LogSource::Kudu(KuduClient::new(endpoint, token)?))
             }
-            SourceDef::LocalFolder { root } => {
-                Ok(LogSource::LocalFolder(LocalFolder::new(root.as_deref(), endpoint)))
-            }
+            SourceDef::LocalFolder { root } => Ok(LogSource::LocalFolder(LocalFolder::new(
+                root.as_deref(),
+                endpoint,
+            ))),
         }
     }
 
@@ -69,8 +70,8 @@ impl LogSource {
 
     /// Copies a file to `dest`. With `range_from`, fetches only the bytes from
     /// that offset - what keeps a growing file from being re-read in full.
-    /// `expected_size` caps the transfer at what the listing promised, so a file
-    /// being appended to while it is read still terminates.
+    /// `expected_size` is a listing estimate, never a cutoff for newer content.
+    /// HTTP transfers consume the response; local copies snapshot the opened file.
     pub async fn download_file(
         &self,
         path: &str,
@@ -126,7 +127,9 @@ impl LocalFolder {
         let mut resolved = self.base.clone();
         for part in relative.split(['/', '\\']).filter(|p| !p.is_empty()) {
             if part == ".." {
-                return Err(format!("Log location \"{path}\" climbs out of the source folder"));
+                return Err(format!(
+                    "Log location \"{path}\" climbs out of the source folder"
+                ));
             }
             if part == "." {
                 continue;
@@ -138,8 +141,8 @@ impl LocalFolder {
 
     fn list_dir(&self, path: &str) -> Result<Vec<SourceEntry>, String> {
         let dir = self.resolve(path)?;
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
 
         let mut out = Vec::new();
         for entry in entries.flatten() {
@@ -164,19 +167,19 @@ impl LocalFolder {
         path: &str,
         dest: &Path,
         range_from: Option<u64>,
-        expected_size: Option<u64>,
+        _expected_size: Option<u64>,
         cancel: &AtomicBool,
         mut on_chunk: impl FnMut(u64),
     ) -> Result<DownloadResult, String> {
         let source = self.resolve(path)?;
         let mut file = std::fs::File::open(&source)
             .map_err(|e| format!("Cannot open {}: {e}", source.display()))?;
+        let len = file
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| format!("Cannot stat {}: {e}", source.display()))?;
 
         if let Some(from) = range_from {
-            let len = file
-                .metadata()
-                .map(|m| m.len())
-                .map_err(|e| format!("Cannot stat {}: {e}", source.display()))?;
             // Nothing past the offset: the file has not grown. An empty partial
             // is the same answer Kudu gives with a 416, so the caller's
             // append-or-replace logic needs no special case here.
@@ -193,9 +196,9 @@ impl LocalFolder {
                 .map_err(|e| format!("Cannot seek {}: {e}", source.display()))?;
         }
 
-        // Only ever the tail the caller asked for: bytes past the listed size
-        // belong to the next sync, exactly as with a remote transport.
-        let cap = expected_size.map(|size| size.saturating_sub(range_from.unwrap_or(0)));
+        // Snapshot the actual file at open time, so an old listing does not omit
+        // existing data and continuous writes cannot prolong the copy indefinitely.
+        let cap = len.saturating_sub(range_from.unwrap_or(0));
         let out = std::fs::File::create(dest)
             .map_err(|e| format!("Cannot create {}: {e}", dest.display()))?;
         let mut writer = std::io::BufWriter::new(out);
@@ -212,11 +215,10 @@ impl LocalFolder {
                     truncated: true,
                 });
             }
-            let want = match cap {
-                Some(cap) if cap.saturating_sub(written) == 0 => break,
-                Some(cap) => (cap - written).min(COPY_CHUNK as u64) as usize,
-                None => COPY_CHUNK,
-            };
+            let want = cap.saturating_sub(written).min(COPY_CHUNK as u64) as usize;
+            if want == 0 {
+                break;
+            }
             let read = file
                 .read(&mut buffer[..want])
                 .map_err(|e| format!("Cannot read {}: {e}", source.display()))?;
@@ -234,7 +236,7 @@ impl LocalFolder {
         Ok(DownloadResult {
             bytes_written: written,
             was_partial: range_from.is_some(),
-            truncated: false,
+            truncated: written < cap,
         })
     }
 }
@@ -326,10 +328,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "456789");
     }
 
-    /// The listing's size is the cap: bytes appended after it was taken are left
-    /// for the next sync rather than making this transfer run on.
+    /// An earlier listing must not hide data already present when copying starts.
     #[test]
-    fn stops_at_the_size_the_listing_promised() {
+    fn copies_the_current_file_despite_a_stale_listing() {
         let dir = temp_dir("cap");
         std::fs::write(dir.join("a.log"), "0123456789ABCDEF").unwrap();
         let dest = dir.join("out.bin");
@@ -340,8 +341,36 @@ mod tests {
             .copy_file("a.log", &dest, None, Some(10), &cancel, |_| {})
             .unwrap();
 
-        assert_eq!(result.bytes_written, 10);
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "0123456789");
+        assert_eq!(result.bytes_written, 16);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "0123456789ABCDEF");
+    }
+
+    #[test]
+    fn stops_at_the_snapshot_size_even_if_the_local_file_keeps_growing() {
+        let dir = temp_dir("snapshot");
+        let original = vec![b'a'; COPY_CHUNK * 2];
+        std::fs::write(dir.join("a.log"), &original).unwrap();
+        let dest = dir.join("out.bin");
+        let folder = LocalFolder::new(None, dir.to_str().unwrap());
+        let result = folder
+            .copy_file(
+                "a.log",
+                &dest,
+                None,
+                Some(10),
+                &AtomicBool::new(false),
+                |_| {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(dir.join("a.log"))
+                        .unwrap()
+                        .write_all(&[b'b'; COPY_CHUNK])
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(result.bytes_written, original.len() as u64);
+        assert_eq!(std::fs::read(dest).unwrap(), original);
     }
 
     #[test]

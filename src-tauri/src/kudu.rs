@@ -66,10 +66,6 @@ enum AttemptError {
         bytes: u64,
         was_partial: bool,
     },
-    /// A resume request was answered with 200: the server ignores Range and
-    /// would resend the whole file. Continuing is pointless - the salvaged
-    /// prefix is kept and the next sync picks up from it.
-    ResumeUnsupported,
 }
 
 /// How many times a transient (send or truncated-body) failure is retried before
@@ -87,15 +83,17 @@ impl KuduClient {
         if !base.starts_with("https://") {
             return Err(format!("Kudu URL must be https: {base}"));
         }
-        // gzip: Kudu compresses log text ~15x and its VFS API cannot serve byte
-        // ranges, so live files are always transferred whole - compression is
-        // what keeps that transfer (and the data's staleness) short. reqwest
-        // decompresses transparently; all sizes stay in decompressed bytes.
+        // Keep full transfers small when the endpoint ignores Range. reqwest
+        // decompresses gzip transparently; all stored sizes are decoded bytes.
         let client = reqwest::Client::builder()
             .gzip(true)
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(KuduClient { base, token, client })
+        Ok(KuduClient {
+            base,
+            token,
+            client,
+        })
     }
 
     fn vfs_url(&self, path: &str) -> String {
@@ -130,10 +128,9 @@ impl KuduClient {
     /// bytes from that offset (Kudu VFS answers 206) - used to sync growing files.
     /// A 416 on a ranged request means the file has nothing past the offset and
     /// yields an empty partial result rather than an error.
-    /// `expected_size` is the file size from the directory listing: the stream is
-    /// cut off at that offset, because a live file that is being appended while it
-    /// is read would otherwise keep the transfer running indefinitely. Bytes past
-    /// the listed size are left for the next sync's ranged probe.
+    /// The directory size is only a progress estimate. Read the complete HTTP
+    /// response, whose framing defines its end; an older listing must never cut
+    /// off data the server is already sending, including decoded gzip content.
     /// `on_chunk` receives the running byte count for progress reporting.
     /// `cancel` is polled per chunk: a set flag stops the transfer mid-stream and
     /// what already arrived is returned as a truncated (resumable) result.
@@ -142,7 +139,7 @@ impl KuduClient {
         path: &str,
         dest: &Path,
         range_from: Option<u64>,
-        expected_size: Option<u64>,
+        _expected_size: Option<u64>,
         cancel: &AtomicBool,
         mut on_chunk: impl FnMut(u64),
     ) -> Result<DownloadResult, String> {
@@ -172,42 +169,44 @@ impl KuduClient {
             }
             // Resume offset: the caller's range plus whatever is already salvaged.
             // A full download (range_from None) that was cut becomes ranged on retry.
-            let offset = match range_from {
-                Some(from) => Some(from + salvaged),
-                None if salvaged > 0 => Some(salvaged),
-                None => None,
+            let offset = if salvaged > 0 {
+                let start = if original_partial == Some(true) {
+                    range_from.unwrap_or(0)
+                } else {
+                    0
+                };
+                Some(start + salvaged)
+            } else {
+                range_from
             };
-            let append = salvaged > 0;
-            let base = salvaged;
             match self
-                .try_download(path, dest, offset, expected_size, append, cancel, &mut |n| {
-                    on_chunk(base + n)
-                })
+                .try_download(path, dest, offset, salvaged, cancel, &mut on_chunk)
                 .await
             {
                 Ok(mut result) => {
                     // The salvaged prefix is already on disk; add it to this
                     // attempt's bytes and report the caller's original partial-ness.
-                    result.bytes_written += salvaged;
-                    if let Some(partial) = original_partial {
-                        result.was_partial = partial;
+                    if salvaged > 0 && result.was_partial {
+                        result.bytes_written += salvaged;
+                        result.was_partial = original_partial.unwrap_or(result.was_partial);
                     }
                     return Ok(result);
                 }
                 // A bad status (or local I/O error) will not change on retry.
                 Err(AttemptError::Status(message)) => return Err(message),
-                // The server cannot resume - stop retrying and keep the salvage.
-                Err(AttemptError::ResumeUnsupported) => break,
                 Err(AttemptError::Send(message)) => last_error = Some(message),
                 Err(AttemptError::Truncated {
                     message,
                     bytes,
                     was_partial,
                 }) => {
-                    if original_partial.is_none() {
+                    if salvaged > 0 && was_partial {
+                        salvaged += bytes;
+                    } else {
+                        // A 200 replaces the prefix and restarts from byte zero.
                         original_partial = Some(was_partial);
+                        salvaged = bytes;
                     }
-                    salvaged += bytes;
                     last_error = Some(message);
                 }
             }
@@ -236,8 +235,7 @@ impl KuduClient {
         path: &str,
         dest: &Path,
         range_from: Option<u64>,
-        expected_size: Option<u64>,
-        append: bool,
+        resume_bytes: u64,
         cancel: &AtomicBool,
         on_chunk: &mut impl FnMut(u64),
     ) -> Result<DownloadResult, AttemptError> {
@@ -253,6 +251,7 @@ impl KuduClient {
             .map_err(|e| AttemptError::Send(format!("Kudu download failed: {e}")))?;
 
         let status = response.status();
+        let append = resume_bytes > 0;
         // Nothing past the requested offset - the remote file has not grown. When
         // resuming (append) the salvaged prefix already on disk is what we keep, so
         // do not recreate `dest`; only a fresh probe starts an empty file.
@@ -279,22 +278,9 @@ impl KuduClient {
         }
         let was_partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
 
-        // A resume answered with 200 restarts at byte zero: the server ignores
-        // Range and re-sending everything before the salvaged prefix can take
-        // minutes with nothing to show for it. Keep the salvage instead - the
-        // next sync continues from it.
-        if append && !was_partial {
-            return Err(AttemptError::ResumeUnsupported);
-        }
-
-        // How many bytes of this response to keep: up to the listed file size,
-        // counted from where the response starts in the remote file (a 206 honors
-        // the requested offset, a 200 restarts from zero). Without the cap a live
-        // file appended while it is read keeps the stream open indefinitely.
-        let cap = expected_size.map(|size| {
-            let start = if was_partial { range_from.unwrap_or(0) } else { 0 };
-            size.saturating_sub(start)
-        });
+        // A server that ignores Range sends a fresh full response. Finish it in
+        // this sync, replacing the salvaged prefix rather than deferring to the user.
+        let append = append && was_partial;
 
         // Resuming appends the missing tail to the salvaged prefix; a fresh attempt
         // starts (or replaces) the file.
@@ -304,8 +290,9 @@ impl KuduClient {
                 .open(dest)
                 .map_err(|e| AttemptError::Status(format!("Cannot open {}: {e}", dest.display())))?
         } else {
-            std::fs::File::create(dest)
-                .map_err(|e| AttemptError::Status(format!("Cannot create {}: {e}", dest.display())))?
+            std::fs::File::create(dest).map_err(|e| {
+                AttemptError::Status(format!("Cannot create {}: {e}", dest.display()))
+            })?
         };
         let mut writer = std::io::BufWriter::new(file);
         let mut bytes_written: u64 = 0;
@@ -341,7 +328,7 @@ impl KuduClient {
                     truncated: true,
                 });
             }
-            let mut chunk = match chunk {
+            let chunk = match chunk {
                 Ok(chunk) => chunk,
                 // The body was cut short. Flush what arrived so the caller can keep
                 // it as a resumable prefix rather than discarding the whole transfer.
@@ -354,22 +341,11 @@ impl KuduClient {
                     });
                 }
             };
-            if let Some(cap) = cap {
-                let remaining = cap.saturating_sub(bytes_written);
-                if (chunk.len() as u64) > remaining {
-                    chunk = chunk.slice(..remaining as usize);
-                }
-            }
-            writer
-                .write_all(&chunk)
-                .map_err(|e| AttemptError::Status(format!("Write to {} failed: {e}", dest.display())))?;
+            writer.write_all(&chunk).map_err(|e| {
+                AttemptError::Status(format!("Write to {} failed: {e}", dest.display()))
+            })?;
             bytes_written += chunk.len() as u64;
-            on_chunk(bytes_written);
-            // Everything the listing promised has arrived - stop reading; dropping
-            // the stream closes the connection even if the file has grown since.
-            if cap.is_some_and(|cap| bytes_written >= cap) {
-                break;
-            }
+            on_chunk(bytes_written + if append { resume_bytes } else { 0 });
         }
         writer
             .flush()
@@ -380,5 +356,304 @@ impl KuduClient {
             was_partial,
             truncated: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn response(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes =
+            format!("HTTP/1.1 {status}\r\nConnection: close\r\n{headers}\r\n").into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    async fn server(responses: Vec<Vec<u8>>) -> (KuduClient, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                requests.push(String::from_utf8(request).unwrap().to_lowercase());
+                socket.write_all(&response).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+        // Only the local test server bypasses the production HTTPS requirement.
+        let client = KuduClient {
+            base,
+            token: "test-token".into(),
+            client: reqwest::Client::builder()
+                .gzip(true)
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        };
+        (client, task)
+    }
+
+    fn destination(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("loglooker-kudu-{}-{name}.log", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn downloads_the_complete_response_despite_a_stale_listing() {
+        for (name, status, headers, body, offset, expected) in [
+            (
+                "full",
+                "200 OK",
+                "Content-Length: 16\r\n",
+                "0123456789ABCDEF",
+                None,
+                "0123456789ABCDEF",
+            ),
+            (
+                "tail",
+                "206 Partial Content",
+                "Content-Length: 6\r\nContent-Range: bytes 10-15/16\r\n",
+                "ABCDEF",
+                Some(10),
+                "ABCDEF",
+            ),
+            (
+                "chunked",
+                "200 OK",
+                "Transfer-Encoding: chunked\r\n",
+                "10\r\n0123456789ABCDEF\r\n0\r\n\r\n",
+                None,
+                "0123456789ABCDEF",
+            ),
+        ] {
+            let (client, task) = server(vec![response(status, headers, body.as_bytes())]).await;
+            let dest = destination(name);
+            let result = client
+                .download_file(
+                    "today.log",
+                    &dest,
+                    offset,
+                    Some(10),
+                    &AtomicBool::new(false),
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), expected, "{name}");
+            assert_eq!(result.bytes_written, expected.len() as u64);
+            assert!(!result.truncated);
+            task.await.unwrap();
+            std::fs::remove_file(dest).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_a_cut_download_when_the_server_ignores_range() {
+        let (client, task) = server(vec![
+            response("200 OK", "Content-Length: 16\r\n", b"01234"),
+            response("200 OK", "Content-Length: 16\r\n", b"0123456789ABCDEF"),
+        ])
+        .await;
+        let dest = destination("retry-full");
+        let result = client
+            .download_file(
+                "today.log",
+                &dest,
+                None,
+                Some(16),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated, "the same sync must finish the retry");
+        assert!(!result.was_partial);
+        assert_eq!(result.bytes_written, 16);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "0123456789ABCDEF");
+        let requests = task.await.unwrap();
+        assert!(requests[1].contains("range: bytes=5-"));
+        std::fs::remove_file(dest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloads_all_decoded_gzip_bytes_despite_a_stale_listing() {
+        // gzip encoding of "0123456789ABCDEF", including its checksum and trailer.
+        let gzip = [
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 10, 51, 48, 52, 50, 54, 49, 53, 51, 183, 176, 116, 116,
+            114, 118, 113, 117, 3, 0, 181, 55, 60, 152, 16, 0, 0, 0,
+        ];
+        let (client, task) = server(vec![response(
+            "200 OK",
+            "Content-Encoding: gzip\r\nContent-Length: 36\r\n",
+            &gzip,
+        )])
+        .await;
+        let dest = destination("gzip");
+        let result = client
+            .download_file(
+                "today.log",
+                &dest,
+                None,
+                Some(10),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "0123456789ABCDEF");
+        assert_eq!(result.bytes_written, 16);
+        assert!(!result.truncated);
+        task.await.unwrap();
+        std::fs::remove_file(dest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_full_retries_do_not_duplicate_the_salvaged_prefix() {
+        let (client, task) = server(vec![
+            response("200 OK", "Content-Length: 16\r\n", b"01234"),
+            response("200 OK", "Content-Length: 16\r\n", b"01234567"),
+            response("200 OK", "Content-Length: 16\r\n", b"0123456789ABCDEF"),
+        ])
+        .await;
+        let dest = destination("retry-twice");
+        let result = client
+            .download_file(
+                "today.log",
+                &dest,
+                Some(3),
+                Some(16),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert!(!result.was_partial);
+        assert_eq!(result.bytes_written, 16);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "0123456789ABCDEF");
+        let requests = task.await.unwrap();
+        assert!(requests[2].contains("range: bytes=8-"));
+        std::fs::remove_file(dest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_growing_log_reports_a_transfer_that_remains_incomplete() {
+        let prefix = b"2026-09-07 10:00:00 INFO first entry\n";
+        let (client, task) = server(vec![
+            response("200 OK", "Content-Length: 1000\r\n", prefix);
+            DOWNLOAD_ATTEMPTS
+        ])
+        .await;
+        let dir = destination("growing-incomplete");
+        std::fs::create_dir_all(&dir).unwrap();
+        let service = serde_json::from_value(serde_json::json!({
+            "id": "test/app", "name": "app", "environment": "test"
+        }))
+        .unwrap();
+        let file = crate::locations::RemoteLogFile {
+            vfs_path: "Log.txt".into(),
+            name: "Log.txt".into(),
+            size: 1000,
+            mtime: "2026-09-07T10:00:00Z".into(),
+            date: None,
+            instance: None,
+        };
+        let mut manifest = crate::cache::Manifest::default();
+        let summary = crate::growing::sync_growing(
+            &crate::source::LogSource::Kudu(client),
+            &dir,
+            &service,
+            &mut manifest,
+            vec![file],
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("transfer interrupted")),
+            "partial logs must not be silently reported as complete"
+        );
+        assert_eq!(manifest.growing["Log.txt"].remote_size, prefix.len() as u64);
+        task.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumes_from_zero_based_bytes_after_a_range_was_ignored() {
+        let (client, task) = server(vec![
+            response("200 OK", "Content-Length: 16\r\n", b"01234"),
+            response(
+                "206 Partial Content",
+                "Content-Length: 11\r\nContent-Range: bytes 5-15/16\r\n",
+                b"56789ABCDEF",
+            ),
+        ])
+        .await;
+        let dest = destination("retry-offset");
+        let result = client
+            .download_file(
+                "today.log",
+                &dest,
+                Some(3),
+                Some(16),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert!(!result.was_partial);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "0123456789ABCDEF");
+        let requests = task.await.unwrap();
+        assert!(requests[1].contains("range: bytes=5-"), "{}", requests[1]);
+        std::fs::remove_file(dest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_tail_stays_partial_for_the_cache_append() {
+        let (client, task) = server(vec![
+            response(
+                "206 Partial Content",
+                "Content-Length: 13\r\nContent-Range: bytes 3-15/16\r\n",
+                b"34",
+            ),
+            response(
+                "206 Partial Content",
+                "Content-Length: 11\r\nContent-Range: bytes 5-15/16\r\n",
+                b"56789ABCDEF",
+            ),
+        ])
+        .await;
+        let dest = destination("retry-partial");
+        let result = client
+            .download_file(
+                "today.log",
+                &dest,
+                Some(3),
+                Some(10),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(!result.truncated);
+        assert!(result.was_partial);
+        assert_eq!(result.bytes_written, 13);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "3456789ABCDEF");
+        let requests = task.await.unwrap();
+        assert!(requests[1].contains("range: bytes=5-"));
+        std::fs::remove_file(dest).unwrap();
     }
 }

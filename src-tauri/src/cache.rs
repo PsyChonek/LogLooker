@@ -269,7 +269,7 @@ pub async fn sync_service(
                         file_index: index + 1,
                         file_count,
                         bytes_downloaded: downloaded,
-                        // Downloads are capped at the listed size, so this never exceeds it
+                        // The listing can lag behind the content actually transferred.
                         total_bytes: file.size.max(downloaded),
                         state: state.into(),
                     });

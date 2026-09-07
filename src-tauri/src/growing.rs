@@ -100,7 +100,7 @@ pub async fn sync_growing(
             file_index: 1,
             file_count: 1,
             bytes_downloaded: bytes,
-            // Downloads are capped at the listed size, so this never exceeds it
+            // The listing can lag behind the content actually transferred.
             total_bytes: file.size.max(bytes),
             state: phase.into(),
         })
@@ -130,7 +130,7 @@ pub async fn sync_growing(
             };
             if result.was_partial {
                 if result.bytes_written >= overlap && file_matches_at(&temp, 0, &tail)? {
-                    if result.bytes_written == overlap {
+                    if result.bytes_written == overlap && !result.truncated {
                         // Nothing past the cached bytes - the cache is current
                         std::fs::remove_file(&temp).ok();
                         summary.files_skipped = 1;
@@ -144,6 +144,7 @@ pub async fn sync_growing(
                         tail_seed: tail,
                         remote_size: range_from + result.bytes_written,
                         bytes_downloaded: result.bytes_written,
+                        truncated: result.truncated,
                     })
                 } else {
                     // Rotated (or shrank since the listing) - take the whole file
@@ -155,7 +156,7 @@ pub async fn sync_growing(
                 if result.bytes_written >= s.remote_size
                     && file_matches_at(&temp, range_from, &tail)?
                 {
-                    if result.bytes_written == s.remote_size {
+                    if result.bytes_written == s.remote_size && !result.truncated {
                         std::fs::remove_file(&temp).ok();
                         summary.files_skipped = 1;
                         emit(0, "skipped");
@@ -168,6 +169,7 @@ pub async fn sync_growing(
                         tail_seed: tail,
                         remote_size: result.bytes_written,
                         bytes_downloaded: result.bytes_written,
+                        truncated: result.truncated,
                     })
                 } else {
                     Some(Fetch {
@@ -177,6 +179,7 @@ pub async fn sync_growing(
                         tail_seed: Vec::new(),
                         remote_size: result.bytes_written,
                         bytes_downloaded: result.bytes_written,
+                        truncated: result.truncated,
                     })
                 }
             }
@@ -216,6 +219,7 @@ pub async fn sync_growing(
                 tail_seed: Vec::new(),
                 remote_size: result.bytes_written,
                 bytes_downloaded: result.bytes_written,
+                truncated: result.truncated,
             }
         }
     };
@@ -253,6 +257,12 @@ pub async fn sync_growing(
     );
     cache::save_manifest(dir, manifest)?;
 
+    if fetch.truncated {
+        summary.warnings.push(format!(
+            "{}: transfer interrupted - cached logs are incomplete; sync again to retry",
+            file.name
+        ));
+    }
     summary.files_downloaded = 1;
     summary.bytes_downloaded = fetch.bytes_downloaded;
     emit(fetch.bytes_downloaded, "done");
@@ -274,6 +284,7 @@ struct Fetch {
     /// Remote bytes consumed after this sync
     remote_size: u64,
     bytes_downloaded: u64,
+    truncated: bool,
 }
 
 /// Splits the legacy single-file cache (Log.txt.zst) into day segments once,
