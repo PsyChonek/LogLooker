@@ -16,6 +16,10 @@ export interface DateRange {
   to: string;
 }
 
+export interface DateRangeSelection extends DateRange {
+  preset: PresetId | null;
+}
+
 export interface DatePreset {
   id: PresetId;
   label: string;

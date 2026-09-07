@@ -2,7 +2,7 @@ import { computed, ref, watch } from 'vue';
 import { acceptHMRUpdate, defineStore } from 'pinia';
 import { invoke } from '@tauri-apps/api/core';
 import { parseAuthError, type AuthNotice } from '@/utils/authError';
-import { resolvePreset, todayKey, type PresetId } from '@/utils/dateRange';
+import { resolvePreset, todayKey, type DateRangeSelection, type PresetId } from '@/utils/dateRange';
 import type {
   AppConfig,
   CacheStatus,
@@ -100,6 +100,13 @@ export const useAppStore = defineStore('app', () => {
     const preset = datePreset.value ? resolvePreset(datePreset.value, today.value) : null;
     return preset ?? { from: customFrom.value, to: customTo.value };
   });
+
+  function setDateRange(selection: DateRangeSelection) {
+    customFrom.value = selection.from;
+    customTo.value = selection.to;
+    refreshToday();
+    datePreset.value = selection.preset;
+  }
 
   // Writing either end means the user picked explicit dates, so the preset drops.
   const dateFrom = computed({
@@ -293,6 +300,7 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function syncSelected(): Promise<SyncSummary[]> {
+    refreshToday();
     syncing.value = true;
     cancelling.value = false;
     syncProgress.value = {};
@@ -323,6 +331,7 @@ export const useAppStore = defineStore('app', () => {
   // cached files for the range are decompressed into a folder the user picks,
   // one subfolder per service. Reuses the sync-progress events for live status.
   async function downloadSelected(targetDir: string): Promise<DownloadSummary[]> {
+    refreshToday();
     downloading.value = true;
     cancelling.value = false;
     syncProgress.value = {};
@@ -409,6 +418,7 @@ export const useAppStore = defineStore('app', () => {
     datePreset,
     dateFrom,
     dateTo,
+    setDateRange,
     syncing,
     downloading,
     cancelling,

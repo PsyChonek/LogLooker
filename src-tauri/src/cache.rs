@@ -211,7 +211,13 @@ pub async fn sync_service(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let unchanged = manifest.entries.get(&file.vfs_path).is_some_and(|entry| {
+        // A manifest entry is usable only while its compressed file exists.
+        // Otherwise skipping it loses the file, and resuming fetches only its tail.
+        let cached = manifest
+            .entries
+            .get(&file.vfs_path)
+            .filter(|entry| dir.join(&entry.local_name).is_file());
+        let unchanged = cached.is_some_and(|entry| {
             entry.remote_size == file.size && entry.remote_mtime == file.mtime
         });
         if unchanged && !is_live(&file, today) {
@@ -229,7 +235,6 @@ pub async fn sync_service(
             continue;
         }
 
-        let cached = manifest.entries.get(&file.vfs_path);
         // For an unchanged live file the sizes are equal and the ranged probe
         // starts at the end - zero new bytes confirms the cache is current.
         let known_size = cached
@@ -511,6 +516,9 @@ pub fn export_service(
         }
         let source = dir.join(&entry.local_name);
         if !source.exists() {
+            summary.warnings.push(format!(
+                "{name}: cached file is missing; sync its date range to fetch it again"
+            ));
             continue;
         }
         std::fs::create_dir_all(&out_dir)
@@ -795,6 +803,93 @@ pub fn cache_status(service: &ServiceConfig) -> Result<CacheStatus, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sync_restores_missing_cached_files_before_export() {
+        let root = std::env::temp_dir().join(format!(
+            "loglooker-missing-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("LOGLOOKER_CACHE_DIR", root.join("cache"));
+        let pack = crate::plugin::parse_and_compile(
+            r#"{
+                "id": "local", "name": "Local", "source": { "type": "local-folder" },
+                "logLocations": [{ "id": "logs", "label": "Logs", "dir": ".",
+                    "file": "^log-(?<y>\\d{4})-(?<m>\\d{2})-(?<d>\\d{2})\\.log$" }]
+            }"#,
+            crate::plugin::PackOrigin::Bundled,
+            false,
+        )
+        .unwrap();
+        let location = pack.location("logs").unwrap();
+        let today = chrono::Local::now().date_naive();
+        for (name, day, grows) in [
+            ("historical", today.pred_opt().unwrap(), false),
+            ("live", today, false),
+            ("grown", today, true),
+        ] {
+            let source_dir = root.join(name);
+            std::fs::create_dir_all(&source_dir).unwrap();
+            let filename = format!("log-{day}.log");
+            let original = format!("{day} 10:00:00 INFO original content\n");
+            std::fs::write(source_dir.join(&filename), &original).unwrap();
+            let source = LogSource::new(
+                &crate::plugin::SourceDef::LocalFolder { root: None },
+                source_dir.to_str().unwrap(),
+                None,
+            )
+            .unwrap();
+            let service: ServiceConfig = serde_json::from_value(serde_json::json!({
+                "id": format!("test/{name}"), "name": name, "environment": "test"
+            }))
+            .unwrap();
+            let cancel = AtomicBool::new(false);
+            sync_service(&source, &service, location, day, day, &cancel, |_| {})
+                .await
+                .unwrap();
+            let cached = service_dir_path("test", name)
+                .unwrap()
+                .join(format!("{filename}.zst"));
+            std::fs::remove_file(&cached).unwrap();
+            let missing = export_service(&service, day, day, &root.join("export")).unwrap();
+            assert_eq!(missing.files_written, 0);
+            assert!(missing
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cached file is missing")));
+            let expected = if grows {
+                format!("{original}{day} 11:00:00 INFO appended content\n")
+            } else {
+                original
+            };
+            if grows {
+                std::fs::write(source_dir.join(&filename), &expected).unwrap();
+            }
+
+            let summary = sync_service(&source, &service, location, day, day, &cancel, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                summary.files_downloaded, 1,
+                "{name}: missing cache must be fetched"
+            );
+            assert_eq!(summary.files_skipped, 0, "{name}");
+            let export = export_service(&service, day, day, &root.join("export")).unwrap();
+            assert_eq!(export.files_written, 1, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&export.target_dir).join(filename))
+                    .unwrap(),
+                expected
+            );
+        }
+        std::env::remove_var("LOGLOOKER_CACHE_DIR");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// A Log.txt slice: an SQL entry whose @Body spills raw HTML over many lines,
     /// then a later entry. Only the two line-start timestamps may count.

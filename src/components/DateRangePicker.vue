@@ -1,12 +1,18 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { DATE_PRESETS, parseKey, toKey, type DatePreset, type PresetId } from '@/utils/dateRange';
+import { computed, onBeforeUnmount, onMounted, ref, toRefs, watch } from 'vue';
+import {
+  DATE_PRESETS,
+  parseKey,
+  toKey,
+  type DatePreset,
+  type DateRangeSelection,
+} from '@/utils/dateRange';
 
-const from = defineModel<string>('from', { required: true });
-const to = defineModel<string>('to', { required: true });
-// Presets stay relative: the picker reports which one is active and the owner
-// resolves it to dates, so the range keeps following the calendar.
-const preset = defineModel<PresetId | null>('preset', { required: true });
+const props = defineProps<DateRangeSelection>();
+const { from, to, preset } = toRefs(props);
+// Commit all three fields together. Separate model updates can drop an unchanged
+// endpoint while clearing the preset restores older custom dates in the owner.
+const emit = defineEmits<{ change: [selection: DateRangeSelection] }>();
 
 const WEEKDAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
 const MONTHS = [
@@ -110,16 +116,18 @@ function pickDay(key: string) {
     return;
   }
   const start = pendingStart.value;
-  preset.value = null;
-  from.value = start <= key ? start : key;
-  to.value = start <= key ? key : start;
+  emit('change', {
+    preset: null,
+    from: start <= key ? start : key,
+    to: start <= key ? key : start,
+  });
   pendingStart.value = null;
   hovered.value = null;
   open.value = false;
 }
 
 function applyPreset(picked: DatePreset) {
-  preset.value = picked.id;
+  emit('change', { ...picked.range(new Date()), preset: picked.id });
   pendingStart.value = null;
   open.value = false;
 }

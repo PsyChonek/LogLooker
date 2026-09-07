@@ -467,9 +467,10 @@ onUnmounted(() => {
 
       <div class="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
         <DateRangePicker
-          v-model:from="store.dateFrom"
-          v-model:to="store.dateTo"
-          v-model:preset="store.datePreset"
+          :from="store.dateFrom"
+          :to="store.dateTo"
+          :preset="store.datePreset"
+          @change="store.setDateRange"
         />
         <button
           class="px-4 py-1.5 text-xs font-semibold rounded-md bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 transition-colors"
