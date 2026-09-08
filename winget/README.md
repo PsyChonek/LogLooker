@@ -18,7 +18,9 @@ The manual path, for when the token is missing or a release needs redoing:
 ```powershell
 npm run build                                   # bump + build the MSI
 ./scripts/update-winget-manifests.ps1           # fill in SHA256 + ProductCode
-winget validate --manifest winget               # optional
+New-Item -ItemType Directory -Path dist/winget -Force | Out-Null
+Copy-Item winget/*.yaml dist/winget
+winget validate --manifest dist/winget          # only the three YAML manifests
 ./scripts/submit-to-winget.ps1                  # push a branch to your fork
 ```
 
@@ -36,9 +38,8 @@ values, or if their `PackageVersion` disagrees with the version being submitted.
 
 - **Not code-signed.** SmartScreen warns on first run; winget installs it anyway.
   Signing is the only real fix and needs a certificate.
-- `InstallerType: msi` and no `Scope`, matching the SqlPlanForDummies manifests
-  that winget already accepted. Claiming a scope the MSI does not install with
-  makes winget mis-detect it.
+- `InstallerType: wix` and `Scope: machine` match Tauri's generated WiX package,
+  whose `InstallScope` is `perMachine`.
 - The identifier in `tauri.conf.json` (`com.psychonek.loglooker`) determines the
   MSI's UpgradeCode. Changing it makes winget see a different product and stop
   offering upgrades, so it stays put. `bundle.publisher` is set to `PsyChonek`

@@ -119,6 +119,9 @@ jobs:
         shell: pwsh
         run: ./scripts/update-winget-manifests.ps1 -Version "${{ steps.version.outputs.version }}" -ArtifactsPath "release-artifacts"
 
+      - name: Validate and format winget YAML
+        run: npx prettier --write winget/*.yaml
+
       - name: Commit, tag and push
         shell: bash
         run: |
