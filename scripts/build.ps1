@@ -8,7 +8,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
@@ -16,44 +15,10 @@ Set-Location $Root
 $tauriConf = Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
 $AppName = $tauriConf.productName
 
-# --- Read current version ---
-$pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
-$Current = $pkg.version
-Write-Host "Current version: $Current"
-
-# --- Bump version ---
-$parts = $Current.Split('.')
-$Major = [int]$parts[0]
-$Minor = [int]$parts[1]
-$Patch = [int]$parts[2]
-
-switch ($Bump) {
-    "major" { $Major++; $Minor = 0; $Patch = 0 }
-    "minor" { $Minor++; $Patch = 0 }
-    "patch" { $Patch++ }
-}
-$Version = "$Major.$Minor.$Patch"
-Write-Host "New version: $Version"
-
-# --- Update version in all config files ---
-# package.json
-$pkgText = Get-Content "package.json" -Raw
-$pkgText = $pkgText -replace '("version":\s*")([^"]+)"', "`${1}$Version`""
-[System.IO.File]::WriteAllText((Resolve-Path "package.json"), $pkgText, $Utf8NoBom)
-
-# tauri.conf.json
-$confPath = "src-tauri/tauri.conf.json"
-$confText = Get-Content $confPath -Raw
-$confText = $confText -replace '("version":\s*")([^"]+)"', "`${1}$Version`""
-[System.IO.File]::WriteAllText((Resolve-Path $confPath), $confText, $Utf8NoBom)
-
-# Cargo.toml
-$cargoPath = "src-tauri/Cargo.toml"
-$cargo = Get-Content $cargoPath -Raw
-$cargo = $cargo -replace '^version = ".*"', "version = `"$Version`""
-[System.IO.File]::WriteAllText((Resolve-Path $cargoPath), $cargo)
-
-Write-Host "Version bumped to $Version in package.json, tauri.conf.json, Cargo.toml"
+# Use the same version update as GitHub Releases, including both lockfiles.
+$Version = node scripts/bump-version.mjs $Bump
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "Version bumped to $Version in package.json, tauri.conf.json, Cargo.toml and lockfiles"
 
 # --- Build ---
 Write-Host "Building Tauri app..."

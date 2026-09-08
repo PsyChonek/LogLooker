@@ -8,9 +8,10 @@ layout and scripts as `PsyChonek/SqlPlanForDummies`.
 ## Releasing a version
 
 Normally none of this is run by hand: **Actions -> Release -> Run workflow** bumps
-the version, builds the MSI, regenerates these manifests from it, commits them,
-and opens the winget PR via `winget-releaser`. It needs a `WINGET_TOKEN` secret in
-the `release` environment and a fork of winget-pkgs under your account.
+the version, builds x64 and ARM64 installers, regenerates these manifests from the
+MSIs, commits them, and opens the winget PR via `winget-releaser`. It needs a `WINGET_TOKEN` secret in
+the `release` environment and a fork of winget-pkgs under your account. Submission
+is skipped while the repository is private or when `skip_winget` is selected.
 
 The manual path, for when the token is missing or a release needs redoing:
 
@@ -43,5 +44,5 @@ values, or if their `PackageVersion` disagrees with the version being submitted.
   offering upgrades, so it stays put. `bundle.publisher` is set to `PsyChonek`
   because Tauri would otherwise derive the MSI's Manufacturer from the second
   segment of the identifier.
-- Only x64 is built today. The script emits an arm64 entry automatically if an
-  arm64 MSI is present.
+- GitHub releases build both x64 and ARM64. Local `npm run build` builds x64;
+  the manifest script includes every architecture whose MSI is present.

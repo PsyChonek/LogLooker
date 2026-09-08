@@ -100,7 +100,8 @@ Full reference, including scrape discovery and the validation rules:
 ```
 npm install
 npm run tauri dev            # run the app
-npm test                     # typecheck + lint + rust tests (what CI runs)
+npm test                     # typecheck + lint + frontend/script + rust tests
+npm run test:run              # frontend and release script tests (Node 24)
 npm run typecheck            # vue-tsc
 npm run lint                 # eslint
 npm run test:rust            # cargo test
@@ -123,14 +124,20 @@ number.
 
 | Workflow | Trigger | Does |
 | --- | --- | --- |
-| **CI** | push/PR on `main`, nightly | Typecheck, lint and bundle the frontend; run the Rust tests |
-| **Release** | manual (`workflow_dispatch`) | Bump the version, build the MSI, regenerate the winget manifests from it, commit, tag, publish a GitHub release, open a winget PR |
+| **CI** | push/PR on `main`, nightly | Typecheck, lint, frontend/script tests and bundle; Rust tests |
+| **Release** | manual (`workflow_dispatch`) on `main` | Run CI, bump the version, build x64 and ARM64 MSI/NSIS installers, regenerate winget manifests, commit, tag, publish a GitHub release, open a winget PR |
+
+Both workflows use **GitHub-hosted Windows runners** (`windows-latest`) and Node 24,
+following the same manual release flow as SqlPlanForDummies.
 
 To release: **Actions -> Release -> Run workflow**, pick `patch`/`minor`/`major`.
-It commits the bump and the regenerated `winget/` manifests to `main`, tags
-`v<version>`, attaches the MSI and `SHA256SUMS.txt` to the release, and submits
-to winget. `skip_tests` and `skip_winget` are there for a re-run after a partial
-failure.
+It synchronizes `package.json`, `package-lock.json`, `tauri.conf.json`,
+`Cargo.toml` and `Cargo.lock`, commits the bump and regenerated `winget/` manifests
+to `main`, tags `v<version>`, and attaches both architectures' MSI/NSIS installers
+and `SHA256SUMS.txt`. Releases are serialized and existing tags are never replaced.
+Use `skip_tests` only when deliberately bypassing CI, and `skip_winget` to omit
+the winget submission. Winget submission is automatically skipped while the
+repository is private, since its installer URLs must be publicly accessible.
 
 Two things it needs:
 
@@ -141,6 +148,12 @@ Two things it needs:
   [winget/README.md](winget/README.md)).
 - **Push access to `main`** for `github-actions[bot]`, since it commits the bump.
   Branch protection has to allow it.
+
+The version update can be previewed without writing files or publishing:
+
+```
+node scripts/bump-version.mjs patch --dry-run
+```
 
 The manifests can also be produced and submitted from a local build:
 

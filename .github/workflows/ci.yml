@@ -11,6 +11,9 @@ on:
   # Called by the release workflow so a release runs the same gates
   workflow_call:
 
+permissions:
+  contents: read
+
 # Only the newest run per branch matters; a superseded one is wasted minutes
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -18,14 +21,15 @@ concurrency:
 
 jobs:
   frontend:
-    name: Frontend (typecheck, lint, bundle)
+    name: Frontend (typecheck, lint, tests, bundle)
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -36,6 +40,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Frontend and release script tests
+        run: npm run test:run
+
       # The bundle is what the MSI ships, so a build failure has to fail CI and
       # not wait until release time to show up
       - name: Bundle
@@ -44,8 +51,9 @@ jobs:
   rust:
     name: Rust (tests)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -56,9 +64,9 @@ jobs:
       # tauri::generate_context! reads tauri.conf.json, whose beforeBuildCommand
       # points at the frontend bundle - so the crate needs node deps present even
       # to compile its tests
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci

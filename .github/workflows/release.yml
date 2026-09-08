@@ -27,33 +27,42 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   tests:
     name: Run CI Tests
-    if: ${{ !inputs.skip_tests }}
+    if: github.ref == 'refs/heads/main' && !inputs.skip_tests
     uses: ./.github/workflows/ci.yml
 
   release:
     needs: [tests]
     # `always()` so a skipped test job does not cancel the release, while a
     # failed one still does
-    if: always() && (needs.tests.result == 'success' || needs.tests.result == 'skipped')
+    if: always() && !cancelled() && github.ref == 'refs/heads/main' && (needs.tests.result == 'success' || needs.tests.result == 'skipped')
     runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -61,40 +70,27 @@ jobs:
 
       - run: npm ci
 
-      # The version lives in three files that must agree: package.json,
-      # tauri.conf.json (which decides the MSI name) and Cargo.toml.
-      # scripts/build.ps1 does the same thing for local builds.
+      # Update both package manifests and their lockfiles, plus the Tauri version.
       - name: Bump version
         id: version
-        shell: bash
+        shell: pwsh
+        env:
+          VERSION_BUMP: ${{ inputs.bump }}
         run: |
-          CURRENT=$(node -p "require('./package.json').version")
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ inputs.bump }}" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Bumping $CURRENT -> $NEW_VERSION"
+          $version = node scripts/bump-version.mjs $env:VERSION_BUMP
+          if ($LASTEXITCODE -ne 0) { throw 'Version bump failed' }
+          git show-ref --verify --quiet "refs/tags/v$version"
+          if ($LASTEXITCODE -eq 0) { throw "Tag v$version already exists" }
+          if ($LASTEXITCODE -ne 1) { throw 'Could not check release tag' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Releasing v$version"
+          exit 0
 
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            pkg.version = '$NEW_VERSION';
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-          node -e "
-            const fs = require('fs');
-            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
-            conf.version = '$NEW_VERSION';
-            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
-          "
-          sed -i "0,/^version = /s/^version = .*/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
+      - name: Build Windows installers (x64)
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
 
-      - name: Build MSI
-        run: npm run tauri build
+      - name: Build Windows installers (ARM64)
+        run: npm run tauri build -- --target aarch64-pc-windows-msvc
 
       - name: Collect artifacts
         id: artifacts
@@ -102,15 +98,18 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.version }}"
           New-Item -ItemType Directory -Path release-artifacts -Force | Out-Null
-          # Tauri's own file names are kept: winget's InstallerUrl points at them
-          # and the winget-releaser regex below matches them
-          $found = Get-ChildItem -Path src-tauri/target -Recurse -Filter "*_${version}_*.msi" -ErrorAction SilentlyContinue
-          if (-not $found) { throw "No MSI for version $version under src-tauri/target" }
-          $found | ForEach-Object {
-            Copy-Item $_.FullName release-artifacts/
-            Write-Host "  $($_.Name)"
+          # Require an MSI and an NSIS installer from each target's bundle folder.
+          foreach ($target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+            $bundle = "src-tauri/target/$target/release/bundle"
+            foreach ($extension in @('msi', 'exe')) {
+              $found = @(Get-ChildItem -LiteralPath $bundle -Recurse -File |
+                Where-Object { $_.Name -like "*_${version}_*.$extension" })
+              if ($found.Count -ne 1) { throw "Expected one $extension for $target, found $($found.Count)" }
+              Copy-Item -LiteralPath $found[0].FullName -Destination release-artifacts/
+              Write-Host "  $($found[0].Name)"
+            }
           }
-          Get-FileHash release-artifacts/*.msi -Algorithm SHA256 |
+          Get-FileHash -Path release-artifacts/*.msi,release-artifacts/*.exe -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash)  $(Split-Path $_.Path -Leaf)" } |
             Out-File release-artifacts/SHA256SUMS.txt -Encoding utf8
 
@@ -125,19 +124,19 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock winget/
+          git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock winget/
           # [skip ci] so the release commit does not trigger the push-based CI run
           git commit -m "release: v${{ steps.version.outputs.version }} [skip ci]"
-          # Forced, so a retry after a failed run is not blocked by its own tag
-          git tag -f -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
           git push origin HEAD:main
-          git push -f origin "v${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: LogLooker v${{ steps.version.outputs.version }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: release-artifacts/*
           body: |
             The installer is not code-signed, so Windows SmartScreen warns on
@@ -149,12 +148,22 @@ jobs:
 
   winget:
     needs: release
-    if: always() && needs.release.result == 'success' && !inputs.skip_winget
+    if: always() && !cancelled() && needs.release.result == 'success' && !inputs.skip_winget && !github.event.repository.private
     runs-on: windows-latest
+    timeout-minutes: 15
     # Gates the WINGET_TOKEN behind an environment, so a fork's workflow cannot
     # reach it
     environment: release
     steps:
+      - name: Check winget token
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            throw 'Set WINGET_TOKEN in the release environment, or select skip_winget.'
+          }
+
       - name: Publish to winget
         uses: vedantmgoyal9/winget-releaser@v2
         with:
