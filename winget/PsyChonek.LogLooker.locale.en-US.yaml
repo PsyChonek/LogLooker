@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 
 PackageIdentifier: PsyChonek.LogLooker
-PackageVersion: 1.1.8
+PackageVersion: 1.1.13
 PackageLocale: en-US
 Publisher: PsyChonek
 PublisherUrl: https://github.com/PsyChonek
@@ -25,7 +25,7 @@ Tags:
 - devops
 - tauri
 - vue
-ReleaseNotes: 'Version 1.1.8 release.'
-ReleaseNotesUrl: https://github.com/PsyChonek/LogLooker/releases/tag/v1.1.8
+ReleaseNotes: 'Version 1.1.13 release.'
+ReleaseNotesUrl: https://github.com/PsyChonek/LogLooker/releases/tag/v1.1.13
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0
