@@ -69,6 +69,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_logs,
             clear_logs,
+            commands::check_for_updates,
+            commands::install_winget_update,
             commands::get_config,
             commands::update_config,
             commands::open_config_dir,

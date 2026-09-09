@@ -1,6 +1,19 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core';
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
+import { useI18n } from 'vue-i18n';
+import UpdateDialog from '@/components/UpdateDialog.vue';
+
+const { t } = useI18n();
+const updater = ref<InstanceType<typeof UpdateDialog> | null>(null);
+const settingsButton = ref<HTMLButtonElement | null>(null);
+
+async function checkForUpdates() {
+  open.value = false;
+  await nextTick();
+  settingsButton.value?.focus();
+  await updater.value?.check();
+}
 
 const open = ref(false);
 const busy = ref(false);
@@ -36,8 +49,12 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick));
 </script>
 
 <template>
-  <div ref="root" class="relative">
+  <div
+    ref="root"
+    class="relative"
+  >
     <button
+      ref="settingsButton"
       class="p-1.5 rounded transition-colors text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700"
       title="Settings"
       aria-label="Settings"
@@ -45,7 +62,12 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick));
       :aria-expanded="open"
       @click="toggle"
     >
-      <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+      <svg
+        class="w-4 h-4"
+        fill="currentColor"
+        viewBox="0 0 20 20"
+        aria-hidden="true"
+      >
         <path
           fill-rule="evenodd"
           d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.53 1.53 0 01-2.29.95c-1.37-.84-2.94.73-2.1 2.1a1.53 1.53 0 01-.95 2.29c-1.56.38-1.56 2.6 0 2.98a1.53 1.53 0 01.95 2.29c-.84 1.37.73 2.94 2.1 2.1a1.53 1.53 0 012.29.95c.38 1.56 2.6 1.56 2.98 0a1.53 1.53 0 012.29-.95c1.37.84 2.94-.73 2.1-2.1a1.53 1.53 0 01.95-2.29c1.56-.38 1.56-2.6 0-2.98a1.53 1.53 0 01-.95-2.29c.84-1.37-.73-2.94-2.1-2.1a1.53 1.53 0 01-2.29-.95zM10 13a3 3 0 100-6 3 3 0 000 6z"
@@ -65,16 +87,33 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocumentClick));
         role="menuitem"
         @click="openSettingsFolder"
       >
-        <svg class="w-4 h-4 shrink-0" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+        <svg
+          class="w-4 h-4 shrink-0"
+          fill="currentColor"
+          viewBox="0 0 20 20"
+          aria-hidden="true"
+        >
           <path
             d="M2 5a2 2 0 012-2h3.59a2 2 0 011.41.59L10.41 5H16a2 2 0 012 2v7a2 2 0 01-2 2H4a2 2 0 01-2-2V5z"
           />
         </svg>
         <span>{{ busy ? 'Opening...' : 'Open settings folder' }}</span>
       </button>
-      <p v-if="error" class="px-2 pt-2 text-xs text-red-600 dark:text-red-400" role="alert">
+      <button
+        class="w-full rounded px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-100 focus-visible:outline-2 focus-visible:outline-blue-600 dark:text-gray-300 dark:hover:bg-gray-700"
+        role="menuitem"
+        @click="checkForUpdates"
+      >
+        {{ t('updates.check') }}
+      </button>
+      <p
+        v-if="error"
+        class="px-2 pt-2 text-xs text-red-600 dark:text-red-400"
+        role="alert"
+      >
         {{ error }}
       </p>
     </div>
   </div>
+  <UpdateDialog ref="updater" />
 </template>

@@ -7,6 +7,7 @@ mod rawfile;
 mod search;
 mod services;
 mod sync;
+mod updates;
 
 /// Browser arguments for every window we open at runtime. WebView2 refuses to
 /// create a second environment with different options in the same user-data
@@ -24,3 +25,4 @@ pub use rawfile::*;
 pub use search::*;
 pub use services::*;
 pub use sync::*;
+pub use updates::*;

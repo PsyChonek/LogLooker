@@ -1,0 +1,29 @@
+{
+  "updates": {
+    "check": "Check for updates",
+    "title": "LogLooker updates",
+    "available": "Update available",
+    "checking": "Checking winget for updates...",
+    "current": "Running version: {version}",
+    "latest": "Available in winget: {version}",
+    "upToDate": "You have the latest version available in winget.",
+    "instructions": "LogLooker and all its windows will close. Active searches and downloads will stop, and unsaved work will be lost. An update window will open for installer prompts and results. Reopen LogLooker when it finishes.",
+    "install": "Update and close",
+    "installing": "Preparing update...",
+    "later": "Later",
+    "close": "Close",
+    "retry": "Try again",
+    "errors": {
+      "wingetMissing": "Winget is not available. Install or update App Installer from the Microsoft Store, then try again.",
+      "packageUnavailable": "LogLooker is not available in your winget source yet. Try again after its package has been published.",
+      "sourceAgreement": "Winget needs you to accept its source terms. Run winget show --id PsyChonek.LogLooker --exact --source winget in a terminal, then try again.",
+      "checkTimeout": "The winget check timed out. Check your connection and try again.",
+      "checkFailed": "Could not check winget. Check your connection and winget source settings, then try again.",
+      "invalidResponse": "Winget did not return a recognizable release version. Update App Installer and try again.",
+      "unsupportedVersion": "Update checks are not supported for this development version.",
+      "windowsOnly": "Winget updates are available in the Windows desktop app.",
+      "noUpdate": "There is no newer version available in winget. Check again to refresh the result.",
+      "launchFailed": "Could not open the update window. LogLooker is still running. Try again or update through winget in a terminal."
+    }
+  }
+}
