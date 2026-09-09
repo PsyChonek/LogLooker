@@ -13,11 +13,12 @@ MSIs, commits them, and opens the winget PR via `komac submit`. It needs a `WING
 the `release` environment and a fork of winget-pkgs under your account. Submission
 is skipped while the repository is private or when `skip_winget` is selected.
 
-Submission uses the manifests from the release tag and rejects `InstallerLocale`
-at both the root and installer levels. Do not replace this with `komac update` or
-`winget-releaser`: they inspect the MSIs again and can restore `InstallerLocale`
-from `ProductLanguage`. `PackageLocale` and `DefaultLocale` still describe the
-language of the package metadata.
+Submission follows SqlPlanForDummies: sync the winget fork, run `komac update`
+with `--output` and `--dry-run` against the published installers, remove
+`InstallerLocale` with `scripts/remove-winget-installer-locale.ps1`, validate with
+`winget validate`, then run `komac submit`. The initial package must already be
+merged into microsoft/winget-pkgs before this update flow can run.
+`PackageLocale` and `DefaultLocale` still describe the package metadata language.
 
 The manual path, for when the token is missing or a release needs redoing:
 

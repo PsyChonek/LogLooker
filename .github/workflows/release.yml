@@ -172,33 +172,54 @@ jobs:
           ref: v${{ needs.release.outputs.version }}
           persist-credentials: false
 
+      - name: Sync WinGet fork
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          # A stale fork can cause Komac's CreateRef permission error.
+          # Fast-forward only; fail if the fork has diverged.
+          gh repo sync PsyChonek/winget-pkgs --source microsoft/winget-pkgs --branch master
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not sync the WinGet fork. Resolve the sync failure before publishing.'
+          }
+
+      - uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
       - name: Install Komac
         shell: pwsh
-        run: |
-          $url = 'https://github.com/russellbanks/Komac/releases/download/v2.16.0/komac-2.16.0-x86_64-pc-windows-msvc.exe'
-          $expectedHash = 'BDC45BAF028F750DA7519CC8A5F2EAB5DFEF46DFE88650EEB0D0A9BF51446E4F'
-          $executable = Join-Path $env:RUNNER_TEMP 'komac.exe'
-          Invoke-WebRequest -Uri $url -OutFile $executable
-          if ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash -ne $expectedHash) {
-            throw 'Komac download checksum mismatch'
-          }
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo binstall komac --version 2.16.0 -y
 
-      # Submit the release's generated manifests. `komac update` inspects the
-      # MSI again and can add InstallerLocale from ProductLanguage.
-      - name: Check universal installer manifests
+      - name: Generate and validate WinGet manifests
+        id: winget-manifests
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
         run: |
-          $manifests = @(Get-ChildItem -LiteralPath winget -Filter '*.yaml' -File)
-          if ($manifests.Count -ne 3) { throw 'Expected three winget manifests' }
-          if ($manifests | Select-String -Pattern '^\s*(?:-\s*)?InstallerLocale\s*:') {
-            throw 'InstallerLocale must be omitted to keep installer selection universal'
-          }
+          $ErrorActionPreference = 'Stop'
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/v$env:RELEASE_VERSION" `
+            -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" }
+          $urls = @($release.assets | Where-Object { $_.name -match '_(x64|arm64)_en-US\.msi$' } | ForEach-Object { $_.browser_download_url })
+          if ($urls.Count -ne 2) { throw 'Expected x64 and ARM64 MSI release assets.' }
+          $output = Join-Path $env:RUNNER_TEMP "winget-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          komac update PsyChonek.LogLooker --version $env:RELEASE_VERSION --urls @urls --output $output --dry-run
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet manifest generation failed.' }
+          $manifestPath = Join-Path $output "manifests/p/PsyChonek/LogLooker/$env:RELEASE_VERSION"
+          ./scripts/remove-winget-installer-locale.ps1 -Path (Join-Path $manifestPath 'PsyChonek.LogLooker.installer.yaml')
+          winget validate $manifestPath --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet manifest validation failed.' }
+          "path=$manifestPath" >> $env:GITHUB_OUTPUT
 
-      - name: Publish generated manifests to winget
+      - name: Publish validated manifests to WinGet
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
           KOMAC_FORK_OWNER: PsyChonek
-        run: |
-          & (Join-Path $env:RUNNER_TEMP 'komac.exe') submit winget --yes
-          if ($LASTEXITCODE -ne 0) { throw 'Winget submission failed' }
+          MANIFEST_PATH: ${{ steps.winget-manifests.outputs.path }}
+        run: komac submit $env:MANIFEST_PATH --yes
