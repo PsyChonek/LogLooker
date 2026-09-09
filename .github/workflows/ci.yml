@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
   # Catches dependency and toolchain rot on a repo that can sit quiet for weeks
