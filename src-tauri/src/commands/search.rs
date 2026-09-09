@@ -22,6 +22,14 @@ pub struct StoredSearch {
     pub group_names: Vec<String>,
     /// Context width of the search request, applied when pages are hydrated
     pub context_lines: usize,
+    /// What the UI (and the chart windows) were last told about this result.
+    /// Narrowing rewrites its hit count and hands it back, so every reader ends
+    /// up on the same numbers without the scan being re-described.
+    pub meta: SearchMeta,
+    /// Hit sets the narrowing steps replaced, oldest first. Undoing a step pops
+    /// one back; the files and columns are never touched, so only the hit
+    /// vector has to be kept.
+    pub narrowed_from: Vec<Vec<CompactHit>>,
 }
 
 impl Default for StoredSearch {
@@ -33,6 +41,8 @@ impl Default for StoredSearch {
             field_meta: Vec::new(),
             group_names: Vec::new(),
             context_lines: 0,
+            meta: SearchMeta::default(),
+            narrowed_from: Vec::new(),
         }
     }
 }
@@ -62,7 +72,7 @@ pub fn cancel_search(cancel: tauri::State<'_, SearchCancel>) {
     cancel.0.store(true, Ordering::Relaxed);
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchMeta {
     pub total_hits: usize,
@@ -77,6 +87,24 @@ pub struct SearchMeta {
     pub fields: Vec<FieldMeta>,
     /// The configured hit cap cut the result short
     pub truncated: bool,
+}
+
+/// The result's columns as the UI should show them: a field none of the hits
+/// carried a value for would be a column of blanks, so it is left out and the
+/// table never renders it. Which fields a search fills in depends on the packs
+/// and the services it touched, so this is per result rather than per pack.
+fn visible_fields(
+    hits: &[CompactHit],
+    columns: &FieldColumns,
+    metas: &[FieldMeta],
+) -> Vec<FieldMeta> {
+    let populated = columns.populated(hits.iter().map(|hit| hit.row));
+    metas
+        .iter()
+        .enumerate()
+        .filter(|(column, _)| populated.get(*column) == Some(&true))
+        .map(|(_, meta)| meta.clone())
+        .collect()
 }
 
 #[tauri::command]
@@ -156,7 +184,7 @@ pub async fn search_logs(
         lines_scanned: result.lines_scanned,
         duration_ms: result.duration_ms,
         group_names: result.group_names.clone(),
-        fields: result.field_meta.clone(),
+        fields: visible_fields(&result.hits, &result.columns, &result.field_meta),
         truncated: result.truncated,
     };
 
@@ -168,6 +196,8 @@ pub async fn search_logs(
         field_meta: result.field_meta,
         group_names: result.group_names,
         context_lines,
+        meta: meta.clone(),
+        narrowed_from: Vec::new(),
     };
 
     log_state.info(
@@ -184,6 +214,139 @@ pub async fn search_logs(
 
     // Chart windows read the same SearchState; without this they would keep
     // showing the previous search until reopened.
+    let _ = app.emit("search-updated", &meta);
+    Ok(meta)
+}
+
+/// One narrowing step: a second query run over the result already on screen
+/// instead of over the cached files. Only the entries the current hits point at
+/// are re-read, so refining a finished search costs a fraction of repeating it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NarrowRequest {
+    pub query: String,
+    pub is_regex: bool,
+    pub case_sensitive: bool,
+    /// Keep the hits that do *not* match instead of the ones that do
+    #[serde(default)]
+    pub invert: bool,
+}
+
+/// Filters the stored result down to the hits whose entry matches (or, inverted,
+/// does not match) a second query, and remembers what it dropped so the step can
+/// be undone. The hits keep their current order, their columns and their group
+/// masks - this only removes rows, so pages, sorting, charts and exports all
+/// carry on against the narrowed result without knowing about it.
+#[tauri::command]
+pub async fn narrow_search(
+    app: tauri::AppHandle,
+    search_state: tauri::State<'_, SearchState>,
+    cache: tauri::State<'_, Arc<MemCache>>,
+    log_state: tauri::State<'_, LogState>,
+    cancel: tauri::State<'_, SearchCancel>,
+    request: NarrowRequest,
+) -> Result<SearchMeta, String> {
+    if request.query.is_empty() {
+        return Err("Type something to narrow the results with".into());
+    }
+    let matcher = Matcher::new(&request.query, request.is_regex, request.case_sensitive)?;
+    let cancel = Arc::clone(&cancel.0);
+    cancel.store(false, Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    let mut guard = search_state.0.lock().map_err(|e| e.to_string())?;
+    let before = guard.hits.len();
+
+    // Every stored hit's entry is re-read (from RAM where the memory cache holds
+    // the file, streamed from the zstd copy otherwise) and tested exactly as the
+    // scan tested it. A hit whose line the file no longer has - the service was
+    // re-synced shorter meanwhile - is never delivered, and an untestable hit
+    // drops out rather than being kept on trust.
+    let wanted: Vec<(u32, u64, usize)> = guard
+        .hits
+        .iter()
+        .enumerate()
+        .map(|(slot, hit)| (hit.file, hit.line_number, slot))
+        .collect();
+    let mut keep = vec![false; before];
+    let mut done = 0usize;
+    let mut kept = 0usize;
+    let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    search::fetch_hit_lines_cancellable(&guard.files, &wanted, 0, &cache, &cancel, |slot, entry| {
+        let matched = matcher.matches_entry(&entry.line) != request.invert;
+        keep[slot] = matched;
+        done += 1;
+        kept += usize::from(matched);
+        // Throttled the same way the scan's progress is: re-reading is fast
+        // enough that every hit would emit more events than the UI can paint
+        if last_emit.elapsed().as_millis() >= 80 || done == before {
+            last_emit = std::time::Instant::now();
+            app.emit(
+                "search-progress",
+                &search::SearchProgress {
+                    phase: "narrowing".into(),
+                    files_done: done,
+                    files_total: before,
+                    hits: kept,
+                    lines_scanned: 0,
+                    current_file: String::new(),
+                },
+            )
+            .ok();
+        }
+    })?;
+
+    let previous = std::mem::take(&mut guard.hits);
+    let mut narrowed = Vec::with_capacity(kept);
+    narrowed.extend(
+        previous
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| keep[*slot])
+            .map(|(_, hit)| *hit),
+    );
+    guard.hits = narrowed;
+    guard.narrowed_from.push(previous);
+    guard.meta.total_hits = guard.hits.len();
+    // Narrowing can empty a column outright, and the columns keep the values of
+    // the dropped hits, so what is still filled in has to be recounted
+    guard.meta.fields = visible_fields(&guard.hits, &guard.columns, &guard.field_meta);
+    let meta = guard.meta.clone();
+    drop(guard);
+
+    log_state.info(
+        "search",
+        &format!(
+            "narrowed {} to {} hits ({}{}) in {} ms",
+            before,
+            meta.total_hits,
+            if request.invert { "excluding " } else { "" },
+            request.query,
+            started.elapsed().as_millis()
+        ),
+    );
+    let _ = app.emit("search-updated", &meta);
+    Ok(meta)
+}
+
+/// Takes back the last narrowing step, restoring the hits it dropped.
+#[tauri::command]
+pub async fn undo_narrow(
+    app: tauri::AppHandle,
+    search_state: tauri::State<'_, SearchState>,
+) -> Result<SearchMeta, String> {
+    let mut guard = search_state.0.lock().map_err(|e| e.to_string())?;
+    let previous = guard
+        .narrowed_from
+        .pop()
+        .ok_or("These results have not been narrowed")?;
+    guard.hits = previous;
+    guard.meta.total_hits = guard.hits.len();
+    // The restored hits bring their columns back with them
+    guard.meta.fields = visible_fields(&guard.hits, &guard.columns, &guard.field_meta);
+    let meta = guard.meta.clone();
+    drop(guard);
+
     let _ = app.emit("search-updated", &meta);
     Ok(meta)
 }
@@ -343,7 +506,9 @@ pub struct ExportRequest {
     pub path: Option<String>,
     /// Clipboard line cap; ignored when writing a file
     pub max_lines: Option<usize>,
-    /// Named groups the user toggled off in the legend; left out of `extract`
+    /// Named groups the user toggled off in the legend: left out of `extract`,
+    /// and hits that only those groups matched are left out of the output
+    /// entirely, matching what the results table shows
     #[serde(default)]
     pub exclude_groups: Vec<String>,
 }
@@ -363,7 +528,8 @@ pub struct ExportResult {
     pub truncated: bool,
 }
 
-/// Joins one line of text per hit, in the stored (current sort) order.
+/// Joins one line of text per fetched hit, in the stored (current sort) order.
+/// Hits the caller left unfetched (an empty slot) are already out of the export.
 /// `extract` skips hits whose line carries nothing to isolate; `max_lines` caps
 /// the count but `total` still reports the full tally so the UI can say how
 /// many were left out.
@@ -409,13 +575,21 @@ pub async fn export_matches(
     let guard = search_state.0.lock().map_err(|e| e.to_string())?;
     let matcher = Matcher::new(&request.query, request.is_regex, request.case_sensitive)?;
 
-    // Re-read every hit's line, streaming one file at a time; memory holds only
-    // the lines being exported, which the output would contain anyway
+    // A hit whose every matched group is switched off is dropped whole, the same
+    // way the results table hides it. Hits from a query without named groups
+    // carry an empty mask and always stay.
+    let excluded = search::group_mask(&guard.group_names, &request.exclude_groups);
+    let kept = |mask: u32| mask == 0 || mask & !excluded != 0;
+
+    // Re-read every kept hit's line, streaming one file at a time; memory holds
+    // only the lines being exported, which the output would contain anyway.
+    // Slots left unfetched stay `None` and fall out of the export.
     let mut lines: Vec<Option<String>> = vec![None; guard.hits.len()];
     let wanted: Vec<(u32, u64, usize)> = guard
         .hits
         .iter()
         .enumerate()
+        .filter(|(_, hit)| kept(hit.matched_groups))
         .map(|(slot, hit)| (hit.file, hit.line_number, slot))
         .collect();
     search::fetch_hit_lines(&guard.files, &wanted, 0, &cache, |slot, fetched| {

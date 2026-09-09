@@ -345,6 +345,44 @@ impl FieldColumns {
         offset
     }
 
+    /// Which columns hold a value on at least one of `rows`, in column order.
+    /// A field none of a result's hits carried would be an empty table column,
+    /// so the UI leaves it out; whitespace counts as no value, because that is
+    /// what a blank cell would show.
+    ///
+    /// The rows are the ones the hits point at rather than every stored row:
+    /// narrowing drops hits without touching the columns, so the rows they left
+    /// behind must not keep a column alive.
+    pub fn populated(&self, rows: impl IntoIterator<Item = u32>) -> Vec<bool> {
+        let mut found = vec![false; self.columns.len()];
+        let mut left = self.columns.len();
+        if left == 0 {
+            return found;
+        }
+        for row in rows {
+            for (column, filled) in found.iter_mut().enumerate() {
+                if *filled || !self.has_value(column, row) {
+                    continue;
+                }
+                *filled = true;
+                left -= 1;
+            }
+            // Every column has a value somewhere; nothing left to learn
+            if left == 0 {
+                break;
+            }
+        }
+        found
+    }
+
+    fn has_value(&self, column: usize, row: u32) -> bool {
+        match self.columns.get(column) {
+            Some(Column::Text(_)) => self.text(column, row).is_some_and(|v| !v.trim().is_empty()),
+            Some(Column::Number(_)) => self.number(column, row).is_some(),
+            None => false,
+        }
+    }
+
     /// The interned text of a text column. A number column has no text of its
     /// own - `display` is what renders one.
     pub fn text(&self, column: usize, row: u32) -> Option<&str> {
@@ -511,6 +549,26 @@ mod tests {
         assert_eq!(columns.rows(), 1, "merging does not add a row");
         assert_eq!(columns.text(0, 0), Some("GetUser"));
         assert_eq!(columns.number(1, 0), Some(9.0));
+    }
+
+    /// A column the result never filled in is an empty table column, and the UI
+    /// hides it - which only works if emptiness is read off the rows the hits
+    /// actually point at.
+    #[test]
+    fn reports_which_columns_carry_a_value() {
+        let mut columns = FieldColumns::new(&metas());
+        columns.push_row(&row(Some("GetUser"), Some(12.5)));
+        columns.push_row(&row(None, None));
+        // Blank is what an empty cell shows either way
+        columns.push_row(&row(Some("   "), None));
+
+        assert_eq!(columns.populated(0..3), vec![true, true]);
+        assert_eq!(columns.populated(1..3), vec![false, false]);
+        assert_eq!(
+            columns.populated(std::iter::empty()),
+            vec![false, false],
+            "a result with no hits has no columns to show"
+        );
     }
 
     /// Parallel scan units intern independently, so concatenation has to remap

@@ -348,6 +348,9 @@ async function runSearch(
   progress.value = null;
   error.value = null;
   exportMsg.value = null;
+  // The backend gives up the stored result the moment a search starts, so the
+  // steps that were narrowing it are gone whichever way this one ends
+  narrowSteps.value = [];
   // The previous result stays on screen (blurred) until the new one arrives
   try {
     const result = await invoke<SearchMeta>('search_logs', {
@@ -404,6 +407,72 @@ async function cancelSearch() {
   } catch (e) {
     error.value = String(e);
   }
+}
+
+// --- Narrow: a second query run over the result already on screen ---
+
+interface NarrowStep {
+  query: string;
+  isRegex: boolean;
+  caseSensitive: boolean;
+  invert: boolean;
+}
+
+const narrowQuery = ref('');
+const narrowIsRegex = ref(false);
+const narrowCaseSensitive = ref(false);
+const narrowInvert = ref(false);
+// The steps applied to the current result, oldest first. Only the last one can
+// be taken back, so this doubles as the undo depth.
+const narrowSteps = ref<NarrowStep[]>([]);
+
+// A narrow only re-reads the entries the result already points at, never the
+// files, so it runs in a fraction of the time repeating the search would. It
+// borrows the search's busy state: the same overlay, progress and cancel apply.
+async function narrowResults() {
+  if (!meta.value || searching.value || !narrowQuery.value) return;
+  const step: NarrowStep = {
+    query: narrowQuery.value,
+    isRegex: narrowIsRegex.value,
+    caseSensitive: narrowCaseSensitive.value,
+    invert: narrowInvert.value,
+  };
+  searching.value = true;
+  cancelRequested.value = false;
+  progress.value = null;
+  error.value = null;
+  exportMsg.value = null;
+  try {
+    meta.value = await invoke<SearchMeta>('narrow_search', { request: step });
+    narrowSteps.value = [...narrowSteps.value, step];
+    narrowQuery.value = '';
+    await reloadRows();
+  } catch (e) {
+    // A cancelled narrow leaves the result exactly as it was - nothing to say
+    if (String(e) !== 'Search cancelled') error.value = String(e);
+  } finally {
+    searching.value = false;
+    cancelRequested.value = false;
+  }
+}
+
+async function undoNarrow() {
+  if (!meta.value || searching.value || narrowSteps.value.length === 0) return;
+  error.value = null;
+  try {
+    meta.value = await invoke<SearchMeta>('undo_narrow');
+    narrowSteps.value = narrowSteps.value.slice(0, -1);
+    await reloadRows();
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+/** The loaded pages belong to a hit set that has just changed under them. */
+async function reloadRows() {
+  hits.value = [];
+  expanded.value = new Set();
+  await fillVisibleRows();
 }
 
 async function loadMore() {
@@ -491,7 +560,8 @@ const baseColumns: DataTableColumn[] = [
 
 // One column per field the result carries, between Service and Line. The set
 // comes from the result itself (SearchMeta.fields), so a plugin's fields appear
-// as columns without the app knowing any of them by name.
+// as columns without the app knowing any of them by name - and a field no hit
+// filled in is not in there at all, so an empty column never gets rendered.
 const columns = computed<DataTableColumn[]>(() => {
   const fields = meta.value?.fields ?? [];
   if (fields.length === 0) return baseColumns;
@@ -646,14 +716,37 @@ watch(
   },
 );
 
-const highlighter = computed(() =>
-  buildHighlighter(
-    searchedQuery.value,
-    searchedIsRegex.value,
-    searchedCaseSensitive.value,
-    disabledGroups.value,
-  ),
-);
+// A literal term as a pattern the alternation below can hold
+function highlightSource(query: string, isRegex: boolean): string {
+  return isRegex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Highlighting takes a single pattern, so the terms a narrowed row was kept for
+// are alternated onto the searched query - each one colours where it matched.
+// Their named groups (if any) come after the query's, so the group colours the
+// legend shows never move. An excluding step colours nothing: it kept the rows
+// its term is absent from.
+const highlighter = computed(() => {
+  const plain = () =>
+    buildHighlighter(
+      searchedQuery.value,
+      searchedIsRegex.value,
+      searchedCaseSensitive.value,
+      disabledGroups.value,
+    );
+  const extra = narrowSteps.value.filter((step) => !step.invert);
+  if (extra.length === 0) return plain();
+  const sources = [
+    ...(searchedQuery.value ? [highlightSource(searchedQuery.value, searchedIsRegex.value)] : []),
+    ...extra.map((step) => highlightSource(step.query, step.isRegex)),
+  ];
+  // Case folding is a flag on the whole pattern and JS regex has no inline
+  // (?i:...) to scope it per term, so a mix falls back to insensitive: that
+  // over-colours at worst, where the other way round would miss matches.
+  const caseSensitive = searchedCaseSensitive.value && extra.every((step) => step.caseSensitive);
+  const combined = sources.map((source) => `(?:${source})`).join('|');
+  return buildHighlighter(combined, true, caseSensitive, disabledGroups.value) ?? plain();
+});
 
 // Parts are cached per hit object: rows re-render on expand and scroll far
 // more often than the searched query changes
@@ -869,6 +962,12 @@ const setChips = computed(() => {
 const progressText = computed(() => {
   const p = progress.value;
   if (!p) return 'Starting search...';
+  if (p.phase === 'narrowing') {
+    return (
+      `Narrowing ${p.filesDone.toLocaleString()}/${p.filesTotal.toLocaleString()} entries - ` +
+      `${p.hits.toLocaleString()} kept`
+    );
+  }
   if (p.phase === 'sorting') return `Sorting ${p.hits.toLocaleString()} hits...`;
   if (p.filesTotal === 0) return 'No cached files in range...';
   return (
@@ -1331,6 +1430,60 @@ onUnmounted(() => {
           {{ option }}
         </button>
       </div>
+    </div>
+
+    <div
+      v-if="meta"
+      class="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-600 dark:text-gray-400"
+      :class="searching ? 'opacity-50' : ''"
+    >
+      <input
+        v-model="narrowQuery"
+        type="text"
+        spellcheck="false"
+        placeholder="Narrow these results - search again inside the hits above..."
+        class="flex-1 min-w-[16rem] px-3 py-1 text-xs font-mono rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800"
+        title="Runs over the entries of the current result only, so it costs a fraction of a full search"
+        @keydown.enter="narrowResults"
+      />
+      <BaseCheckbox v-model="narrowIsRegex"> Regex </BaseCheckbox>
+      <BaseCheckbox v-model="narrowCaseSensitive"> Case sensitive </BaseCheckbox>
+      <BaseCheckbox
+        v-model="narrowInvert"
+        title="Keep the entries this term is absent from instead of the ones it matches"
+      >
+        Exclude
+      </BaseCheckbox>
+      <button
+        class="px-3 py-1 font-semibold rounded-md border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
+        :disabled="searching || !narrowQuery"
+        @click="narrowResults"
+      >
+        Narrow
+      </button>
+      <template v-if="narrowSteps.length">
+        <span
+          v-for="(step, i) in narrowSteps"
+          :key="i"
+          class="max-w-[16rem] truncate px-2 py-0.5 rounded-full border font-mono"
+          :class="
+            step.invert
+              ? 'border-red-300 dark:border-red-800 text-red-600 dark:text-red-400'
+              : 'border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400'
+          "
+          :title="`${step.invert ? 'Excluding' : 'Matching'} ${step.query}${step.isRegex ? ' (regex)' : ''}${step.caseSensitive ? ', case sensitive' : ''}`"
+        >
+          {{ step.invert ? '-' : '+' }} {{ step.query }}
+        </span>
+        <button
+          class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
+          :disabled="searching"
+          title="Take back the last narrowing step and bring its hits back"
+          @click="undoNarrow"
+        >
+          Undo narrow
+        </button>
+      </template>
     </div>
 
     <div

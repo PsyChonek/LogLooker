@@ -389,6 +389,24 @@ impl Matcher {
         !self.excludes(line) && self.engine.is_match(line)
     }
 
+    /// Whether a whole entry matches - the header line plus every continuation
+    /// line, newline-joined, as a stored hit reads back. Each line is tested on
+    /// its own (`^` anchors per line and `.` stops at a newline, so testing the
+    /// join would miss every match on a stack-trace or SQL-body line), and an
+    /// exclusion anywhere in the entry vetoes the whole of it - exactly the
+    /// reading the scan gives an entry it builds from the files.
+    pub fn matches_entry(&self, entry: &str) -> bool {
+        let mut matched = false;
+        for line in entry.lines() {
+            if self.excludes(line) {
+                return false;
+            }
+            matched = matched || self.engine.is_match(line);
+        }
+        // An entry of no lines at all still answers to the empty query
+        matched || (entry.is_empty() && self.engine.is_match(""))
+    }
+
     /// Match test that also reports which named groups took part anywhere in
     /// the line; `None` is no match. Patterns without named groups skip the
     /// capture cost entirely and behave exactly like `matches`.
@@ -962,6 +980,27 @@ pub fn fetch_hit_lines(
     wanted: &[(u32, u64, usize)],
     context_lines: usize,
     cache: &MemCache,
+    deliver: impl FnMut(usize, FetchedLine),
+) -> Result<(), String> {
+    fetch_hit_lines_cancellable(
+        files,
+        wanted,
+        context_lines,
+        cache,
+        &AtomicBool::new(false),
+        deliver,
+    )
+}
+
+/// `fetch_hit_lines` for callers that can be asked to stop: re-reading every
+/// hit of a large result takes long enough to deserve a cancel button, and the
+/// flag is read between files and every few thousand lines.
+pub fn fetch_hit_lines_cancellable(
+    files: &[ScanFile],
+    wanted: &[(u32, u64, usize)],
+    context_lines: usize,
+    cache: &MemCache,
+    cancel: &AtomicBool,
     mut deliver: impl FnMut(usize, FetchedLine),
 ) -> Result<(), String> {
     let mut by_file: std::collections::BTreeMap<u32, Vec<(u64, usize)>> =
@@ -971,6 +1010,9 @@ pub fn fetch_hit_lines(
     }
 
     for (file_index, mut lines) in by_file {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
         let file = files
             .get(file_index as usize)
             .ok_or("A stored hit points past the file table")?;
@@ -992,6 +1034,9 @@ pub fn fetch_hit_lines(
                 break;
             }
             line_number += 1;
+            if line_number % CANCEL_CHECK_LINES == 0 && cancel.load(Ordering::Relaxed) {
+                return Err(CANCELLED.into());
+            }
             let text = String::from_utf8_lossy(&buffer);
             let text = text.trim_end_matches(['\r', '\n']);
             let opens_entry = parse_timestamp(text).is_some();
@@ -2382,6 +2427,38 @@ tail line\n";
         );
         assert_eq!(got[1].1.line, "tail line", "an anchor with no entry after it runs to EOF");
         assert_eq!(got[1].1.context_before, ["14.07.2026 10:00:02 info - after"]);
+    }
+
+    /// Narrowing tests a whole entry, and it has to read one exactly as the
+    /// scan does: any line may carry the match, and any line may veto it.
+    #[test]
+    fn matches_entry_tests_every_line_of_the_entry() {
+        let entry = "14.07.2026 10:00:00 error - failed\n   at Repo.Save()\n   at Api.Post()";
+
+        let on_header = Matcher::new("failed", false, false).unwrap();
+        assert!(on_header.matches_entry(entry), "a match on the header line keeps the entry");
+
+        let on_continuation = Matcher::new("Repo.Save", false, false).unwrap();
+        assert!(
+            on_continuation.matches_entry(entry),
+            "a match on a stack-trace line keeps the entry too"
+        );
+
+        let anchored = Matcher::new("^   at Api", true, false).unwrap();
+        assert!(anchored.matches_entry(entry), "^ anchors per line, not at the entry's start");
+
+        let absent = Matcher::new("timeout", false, false).unwrap();
+        assert!(!absent.matches_entry(entry), "a term no line carries drops the entry");
+    }
+
+    #[test]
+    fn matches_entry_lets_an_exclusion_veto_the_whole_entry() {
+        let entry = "14.07.2026 10:00:00 error - failed\n   at Repo.Save()";
+        let excluded = Matcher::new("^(?!.*Repo\\.Save).*failed", true, false).unwrap();
+        assert!(
+            !excluded.matches_entry(entry),
+            "a NOT term on a continuation line rejects the entry its header matched"
+        );
     }
 
     #[test]

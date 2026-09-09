@@ -231,7 +231,9 @@ export interface SearchHit {
 // Live progress of a running search; files scan in parallel, so currentFile
 // is the most recently finished one, not a strict position
 export interface SearchProgress {
-  phase: 'scanning' | 'sorting';
+  // 'narrowing' re-reads the hits of the result already on screen, so its
+  // filesDone/filesTotal count entries rather than files
+  phase: 'scanning' | 'sorting' | 'narrowing';
   filesDone: number;
   filesTotal: number;
   hits: number;
@@ -247,7 +249,9 @@ export interface SearchMeta {
   // Named capture groups of the query, in pattern order
   groupNames: string[];
   // The columns this result carries, in order. Which fields exist depends on the
-  // loaded plugins, so the table takes its extra columns from here.
+  // loaded plugins, so the table takes its extra columns from here. Only fields
+  // at least one hit has a value for are listed - a field none of them carried
+  // would be a column of blanks, so the backend leaves it out.
   fields: FieldInfo[];
   // The configured hit cap cut the result short
   truncated: boolean;

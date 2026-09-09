@@ -94,6 +94,8 @@ pub fn run() {
             commands::cancel_sync,
             commands::cache_status_all,
             commands::search_logs,
+            commands::narrow_search,
+            commands::undo_narrow,
             commands::cancel_search,
             commands::get_search_hits,
             commands::export_matches,
