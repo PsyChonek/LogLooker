@@ -11,5 +11,8 @@
 - Releases build x64 and ARM64 Windows installers and update both package
   manifests and lockfiles. Winget submission requires a public repository and
   `WINGET_TOKEN` in the `release` environment.
+- Omit `InstallerLocale` from winget installer manifests. Submit the generated
+  manifests with `komac submit`; `winget-releaser` / `komac update` can infer and
+  restore the field from MSI metadata.
 - Pushes, release dispatches, history rewrites and repository visibility changes
   require an explicit user request. Setting up workflows does not authorize a release.

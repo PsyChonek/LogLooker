@@ -167,11 +167,38 @@ jobs:
             throw 'Set WINGET_TOKEN in the release environment, or select skip_winget.'
           }
 
-      - name: Publish to winget
-        uses: vedantmgoyal9/winget-releaser@v2
+      - uses: actions/checkout@v7
         with:
-          identifier: PsyChonek.LogLooker
-          token: ${{ secrets.WINGET_TOKEN }}
-          release-tag: v${{ needs.release.outputs.version }}
-          fork-user: PsyChonek
-          installers-regex: '_(x64|arm64)_en-US\.msi$'
+          ref: v${{ needs.release.outputs.version }}
+          persist-credentials: false
+
+      - name: Install Komac
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/russellbanks/Komac/releases/download/v2.16.0/komac-2.16.0-x86_64-pc-windows-msvc.exe'
+          $expectedHash = 'BDC45BAF028F750DA7519CC8A5F2EAB5DFEF46DFE88650EEB0D0A9BF51446E4F'
+          $executable = Join-Path $env:RUNNER_TEMP 'komac.exe'
+          Invoke-WebRequest -Uri $url -OutFile $executable
+          if ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw 'Komac download checksum mismatch'
+          }
+
+      # Submit the release's generated manifests. `komac update` inspects the
+      # MSI again and can add InstallerLocale from ProductLanguage.
+      - name: Check universal installer manifests
+        shell: pwsh
+        run: |
+          $manifests = @(Get-ChildItem -LiteralPath winget -Filter '*.yaml' -File)
+          if ($manifests.Count -ne 3) { throw 'Expected three winget manifests' }
+          if ($manifests | Select-String -Pattern '^\s*(?:-\s*)?InstallerLocale\s*:') {
+            throw 'InstallerLocale must be omitted to keep installer selection universal'
+          }
+
+      - name: Publish generated manifests to winget
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          KOMAC_FORK_OWNER: PsyChonek
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'komac.exe') submit winget --yes
+          if ($LASTEXITCODE -ne 0) { throw 'Winget submission failed' }

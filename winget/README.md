@@ -9,9 +9,15 @@ layout and scripts as `PsyChonek/SqlPlanForDummies`.
 
 Normally none of this is run by hand: **Actions -> Release -> Run workflow** bumps
 the version, builds x64 and ARM64 installers, regenerates these manifests from the
-MSIs, commits them, and opens the winget PR via `winget-releaser`. It needs a `WINGET_TOKEN` secret in
+MSIs, commits them, and opens the winget PR via `komac submit`. It needs a `WINGET_TOKEN` secret in
 the `release` environment and a fork of winget-pkgs under your account. Submission
 is skipped while the repository is private or when `skip_winget` is selected.
+
+Submission uses the manifests from the release tag and rejects `InstallerLocale`
+at both the root and installer levels. Do not replace this with `komac update` or
+`winget-releaser`: they inspect the MSIs again and can restore `InstallerLocale`
+from `ProductLanguage`. `PackageLocale` and `DefaultLocale` still describe the
+language of the package metadata.
 
 The manual path, for when the token is missing or a release needs redoing:
 
@@ -28,7 +34,7 @@ Then open the PR from the link the last script prints.
 
 `update-winget-manifests.ps1` reads the SHA256 and the **ProductCode** out of the
 built MSI rather than having them typed. That matters: the ProductCode changes on
-every version *and* whenever the bundle identifier changes, and a stale one makes
+every version _and_ whenever the bundle identifier changes, and a stale one makes
 winget unable to tell an installed package from an absent one.
 
 `submit-to-winget.ps1` refuses to submit if the manifests still hold placeholder
