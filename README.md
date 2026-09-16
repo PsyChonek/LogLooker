@@ -18,7 +18,11 @@ is worth searching or charting are not built in: they are described by
 - **Narrow** - run the next query over the result already on screen instead of
   over the files: it only re-reads the entries that are still hits, so refining
   costs a fraction of repeating the search. Steps stack, can exclude instead of
-  match, and the last one can be taken back.
+  match, and the last one can be taken back. Enable **Search around** to also
+  match nearby lines in the same file, with separate before/after counts.
+  For example, search for `GraphEmail`, then narrow with `error`, 5 lines before
+  and 0 after. The matched entry itself is always included; counts measure
+  physical lines before its header and after its last continuation line.
 - **Chart** - aggregates the whole result (not just the loaded page) into a
   timeline or a ranked category chart: count, or sum/avg/p50/p95/p99/min/max of
   any numeric field a plugin extracts - or of a number captured by your own

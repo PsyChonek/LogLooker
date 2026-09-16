@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
@@ -411,31 +412,46 @@ async function cancelSearch() {
 
 // --- Narrow: a second query run over the result already on screen ---
 
+const { t } = useI18n();
+
 interface NarrowStep {
   query: string;
   isRegex: boolean;
   caseSensitive: boolean;
   invert: boolean;
+  linesBefore: number;
+  linesAfter: number;
 }
 
 const narrowQuery = ref('');
 const narrowIsRegex = ref(false);
 const narrowCaseSensitive = ref(false);
 const narrowInvert = ref(false);
+const narrowAround = ref(false);
+const narrowLinesBefore = ref(5);
+const narrowLinesAfter = ref(5);
+const narrowWindowValid = computed(
+  () =>
+    !narrowAround.value ||
+    [narrowLinesBefore.value, narrowLinesAfter.value].every(
+      (value) => Number.isInteger(value) && value >= 0 && value <= 1000,
+    ),
+);
 // The steps applied to the current result, oldest first. Only the last one can
 // be taken back, so this doubles as the undo depth.
 const narrowSteps = ref<NarrowStep[]>([]);
 
-// A narrow only re-reads the entries the result already points at, never the
-// files, so it runs in a fraction of the time repeating the search would. It
-// borrows the search's busy state: the same overlay, progress and cancel apply.
+// Narrowing re-reads the matched entries and their requested surroundings.
+// It borrows the search's busy state: the same progress and cancel apply.
 async function narrowResults() {
-  if (!meta.value || searching.value || !narrowQuery.value) return;
+  if (!meta.value || searching.value || !narrowQuery.value || !narrowWindowValid.value) return;
   const step: NarrowStep = {
     query: narrowQuery.value,
     isRegex: narrowIsRegex.value,
     caseSensitive: narrowCaseSensitive.value,
     invert: narrowInvert.value,
+    linesBefore: narrowAround.value ? narrowLinesBefore.value : 0,
+    linesAfter: narrowAround.value ? narrowLinesAfter.value : 0,
   };
   searching.value = true;
   cancelRequested.value = false;
@@ -764,6 +780,11 @@ function lineParts(hit: SearchHit): HighlightPart[] {
     partsCache.set(hit, parts);
   }
   return parts;
+}
+
+function contextParts(lines: string[]): HighlightPart[] {
+  const text = lines.join('\n');
+  return highlighter.value?.parts(text) ?? [{ text, slot: null }];
 }
 
 // --- Extract only: show (and export) just the matched part per line ---
@@ -1441,26 +1462,65 @@ onUnmounted(() => {
         v-model="narrowQuery"
         type="text"
         spellcheck="false"
-        placeholder="Narrow these results - search again inside the hits above..."
+        :placeholder="t('searchAround.placeholder')"
+        :aria-label="t('searchAround.query')"
         class="flex-1 min-w-[16rem] px-3 py-1 text-xs font-mono rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800"
-        title="Runs over the entries of the current result only, so it costs a fraction of a full search"
+        :title="t('searchAround.queryHint')"
         @keydown.enter="narrowResults"
       />
-      <BaseCheckbox v-model="narrowIsRegex"> Regex </BaseCheckbox>
-      <BaseCheckbox v-model="narrowCaseSensitive"> Case sensitive </BaseCheckbox>
-      <BaseCheckbox
-        v-model="narrowInvert"
-        title="Keep the entries this term is absent from instead of the ones it matches"
-      >
-        Exclude
+      <BaseCheckbox v-model="narrowIsRegex">
+        {{ t('searchAround.regex') }}
+      </BaseCheckbox>
+      <BaseCheckbox v-model="narrowCaseSensitive">
+        {{ t('searchAround.caseSensitive') }}
+      </BaseCheckbox>
+      <BaseCheckbox v-model="narrowInvert" :title="t('searchAround.excludeHint')">
+        {{ t('searchAround.exclude') }}
+      </BaseCheckbox>
+      <BaseCheckbox v-model="narrowAround">
+        {{ t('searchAround.enable') }}
       </BaseCheckbox>
       <button
         class="px-3 py-1 font-semibold rounded-md border border-blue-500 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50 transition-colors"
-        :disabled="searching || !narrowQuery"
+        :disabled="searching || !narrowQuery || !narrowWindowValid"
         @click="narrowResults"
       >
-        Narrow
+        {{ t('searchAround.apply') }}
       </button>
+      <div v-if="narrowAround" class="w-full flex flex-wrap items-center gap-3">
+        <label class="flex items-center gap-2">
+          {{ t('searchAround.before') }}
+          <input
+            v-model.number="narrowLinesBefore"
+            type="number"
+            min="0"
+            max="1000"
+            step="1"
+            :aria-invalid="!narrowWindowValid"
+            aria-describedby="search-around-hint"
+            class="w-20 px-2 py-1 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            @keydown.enter="narrowResults"
+          />
+        </label>
+        <label class="flex items-center gap-2">
+          {{ t('searchAround.after') }}
+          <input
+            v-model.number="narrowLinesAfter"
+            type="number"
+            min="0"
+            max="1000"
+            step="1"
+            :aria-invalid="!narrowWindowValid"
+            aria-describedby="search-around-hint"
+            class="w-20 px-2 py-1 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            @keydown.enter="narrowResults"
+          />
+        </label>
+        <span id="search-around-hint">{{ t('searchAround.hint') }}</span>
+        <span v-if="!narrowWindowValid" role="alert" class="text-red-600 dark:text-red-400">
+          {{ t('searchAround.invalidWindow') }}
+        </span>
+      </div>
       <template v-if="narrowSteps.length">
         <span
           v-for="(step, i) in narrowSteps"
@@ -1471,17 +1531,20 @@ onUnmounted(() => {
               ? 'border-red-300 dark:border-red-800 text-red-600 dark:text-red-400'
               : 'border-blue-300 dark:border-blue-800 text-blue-600 dark:text-blue-400'
           "
-          :title="`${step.invert ? 'Excluding' : 'Matching'} ${step.query}${step.isRegex ? ' (regex)' : ''}${step.caseSensitive ? ', case sensitive' : ''}`"
+          :title="`${step.invert ? t('searchAround.exclude') : t('searchAround.apply')}: ${step.query}${step.isRegex ? ' (' + t('searchAround.regex') + ')' : ''}${step.caseSensitive ? ', ' + t('searchAround.caseSensitive') : ''} (${t('searchAround.window', { before: step.linesBefore, after: step.linesAfter })})`"
         >
           {{ step.invert ? '-' : '+' }} {{ step.query }}
+          <template v-if="step.linesBefore || step.linesAfter">
+            ({{ t('searchAround.window', { before: step.linesBefore, after: step.linesAfter }) }})
+          </template>
         </span>
         <button
           class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded hover:text-gray-800 dark:hover:text-gray-200 disabled:opacity-50"
           :disabled="searching"
-          title="Take back the last narrowing step and bring its hits back"
+          :title="t('searchAround.undoHint')"
           @click="undoNarrow"
         >
-          Undo narrow
+          {{ t('searchAround.undo') }}
         </button>
       </template>
     </div>
@@ -1573,7 +1636,10 @@ onUnmounted(() => {
             <div class="px-3 py-2 bg-gray-50 dark:bg-gray-900/50">
               <pre
                 class="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed"
-              ><span class="text-gray-400">{{ hit.contextBefore.join('\n') }}</span>
+              ><span class="text-gray-600 dark:text-gray-400"><template
+    v-for="(part, p) in contextParts(hit.contextBefore)"
+    :key="p"
+  ><span v-if="part.slot !== null" :class="partClass(part)" :style="partStyle(part)">{{ part.text }}</span><template v-else>{{ part.text }}</template></template></span>
   <span class="text-gray-900 dark:text-gray-100 font-semibold"><template
     v-for="(part, p) in lineParts(hit)"
     :key="p"
@@ -1582,7 +1648,10 @@ onUnmounted(() => {
     :class="partClass(part)"
     :style="partStyle(part)"
   >{{ part.text }}</span><template v-else>{{ part.text }}</template></template></span>
-  <span class="text-gray-400">{{ hit.contextAfter.join('\n') }}</span></pre>
+  <span class="text-gray-600 dark:text-gray-400"><template
+    v-for="(part, p) in contextParts(hit.contextAfter)"
+    :key="p"
+  ><span v-if="part.slot !== null" :class="partClass(part)" :style="partStyle(part)">{{ part.text }}</span><template v-else>{{ part.text }}</template></template></span></pre>
               <button
                 class="mt-2 px-2 py-1 text-[10px] border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
                 @click.stop="rawView = hit"

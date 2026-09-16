@@ -1,4 +1,22 @@
 {
+  "searchAround": {
+    "query": "Narrow results query",
+    "placeholder": "Narrow results, e.g. error...",
+    "queryHint": "Search the matched entries. Enable Search around to also check nearby lines.",
+    "regex": "Regex",
+    "caseSensitive": "Case sensitive",
+    "exclude": "Exclude",
+    "excludeHint": "Keep results where this query is absent from the entry and selected surrounding lines.",
+    "enable": "Search around",
+    "apply": "Narrow",
+    "before": "Lines before",
+    "after": "Lines after",
+    "hint": "Includes the matched entry and nearby lines in the same file. Use 0 to skip one direction.",
+    "invalidWindow": "Enter whole numbers from 0 to 1000 for both line counts.",
+    "window": "{before} before, {after} after",
+    "undo": "Undo narrow",
+    "undoHint": "Take back the last narrowing step and bring its hits back."
+  },
   "updates": {
     "check": "Check for updates",
     "title": "LogLooker updates",

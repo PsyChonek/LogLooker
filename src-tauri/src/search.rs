@@ -396,15 +396,34 @@ impl Matcher {
     /// exclusion anywhere in the entry vetoes the whole of it - exactly the
     /// reading the scan gives an entry it builds from the files.
     pub fn matches_entry(&self, entry: &str) -> bool {
+        self.matches_lines(entry.lines())
+    }
+
+    /// Narrow against the entry and its requested surroundings, applying NOT
+    /// criteria to the entire window just as they apply to an entire entry.
+    pub fn matches_fetched(&self, entry: &FetchedLine) -> bool {
+        self.matches_lines(
+            entry
+                .context_before
+                .iter()
+                .map(String::as_str)
+                .chain(entry.line.lines())
+                .chain(entry.context_after.iter().map(String::as_str)),
+        )
+    }
+
+    fn matches_lines<'a>(&self, lines: impl Iterator<Item = &'a str>) -> bool {
         let mut matched = false;
-        for line in entry.lines() {
+        let mut empty = true;
+        for line in lines {
+            empty = false;
             if self.excludes(line) {
                 return false;
             }
             matched = matched || self.engine.is_match(line);
         }
         // An entry of no lines at all still answers to the empty query
-        matched || (entry.is_empty() && self.engine.is_match(""))
+        matched || (empty && self.engine.is_match(""))
     }
 
     /// Match test that also reports which named groups took part anywhere in
@@ -942,6 +961,13 @@ pub struct FetchedLine {
     pub context_after: Vec<String>,
 }
 
+/// Physical lines around a complete entry, bounded by its own file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextWindow {
+    pub before: usize,
+    pub after: usize,
+}
+
 /// An entry's fetched text stops growing here. A multi-megabyte SQL body would
 /// otherwise dominate a page or an export; the raw viewer has the rest.
 const ENTRY_MAX_BYTES: usize = 64 * 1024;
@@ -985,7 +1011,10 @@ pub fn fetch_hit_lines(
     fetch_hit_lines_cancellable(
         files,
         wanted,
-        context_lines,
+        ContextWindow {
+            before: context_lines,
+            after: context_lines,
+        },
         cache,
         &AtomicBool::new(false),
         deliver,
@@ -998,13 +1027,12 @@ pub fn fetch_hit_lines(
 pub fn fetch_hit_lines_cancellable(
     files: &[ScanFile],
     wanted: &[(u32, u64, usize)],
-    context_lines: usize,
+    context: ContextWindow,
     cache: &MemCache,
     cancel: &AtomicBool,
     mut deliver: impl FnMut(usize, FetchedLine),
 ) -> Result<(), String> {
-    let mut by_file: std::collections::BTreeMap<u32, Vec<(u64, usize)>> =
-        std::collections::BTreeMap::new();
+    let mut by_file: std::collections::BTreeMap<u32, Vec<(u64, usize)>> = std::collections::BTreeMap::new();
     for (file, line, slot) in wanted {
         by_file.entry(*file).or_default().push((*line, *slot));
     }
@@ -1020,7 +1048,7 @@ pub fn fetch_hit_lines_cancellable(
         let source = cache.source(&file.path)?;
         let mut reader = source.reader()?;
 
-        let mut ring: VecDeque<String> = VecDeque::with_capacity(context_lines + 1);
+        let mut ring: VecDeque<String> = VecDeque::new();
         let mut pending: Vec<PendingFetch> = Vec::new();
         let mut next = 0;
         let mut line_number: u64 = 0;
@@ -1060,7 +1088,7 @@ pub fn fetch_hit_lines_cancellable(
                         continue;
                     }
                     // The next entry starts here; this line opens the after-context
-                    Phase::Entry | Phase::EntryOverflow => entry.phase = Phase::After(context_lines),
+                    Phase::Entry | Phase::EntryOverflow => entry.phase = Phase::After(context.after),
                     Phase::After(_) => {}
                 }
                 if let Phase::After(remaining) = &mut entry.phase {
@@ -1097,8 +1125,8 @@ pub fn fetch_hit_lines_cancellable(
             }
 
             // The ring rotates its Strings instead of allocating one per line
-            if context_lines > 0 {
-                let mut slot = if ring.len() == context_lines {
+            if context.before > 0 {
+                let mut slot = if ring.len() == context.before {
                     ring.pop_front().unwrap_or_default()
                 } else {
                     String::new()
@@ -1113,6 +1141,9 @@ pub fn fetch_hit_lines_cancellable(
         for done in pending {
             deliver(done.slot, done.fetched);
         }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
     }
     Ok(())
 }
@@ -2312,6 +2343,111 @@ mod tests {
         assert_eq!(got[1].1.line, "14.07.2026 10:00:04 five");
         assert_eq!(got[1].1.context_before, ["14.07.2026 10:00:03 four"]);
         assert!(got[1].1.context_after.is_empty(), "EOF cuts the after-context short");
+    }
+
+    #[test]
+    fn search_around_respects_direction_distance_entries_and_file_boundaries() {
+        let dir = std::env::temp_dir().join(format!(
+            "loglooker-search-around-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let text = "14.07.2026 10:00:00 GraphEmail first\r\n\
+14.07.2026 10:00:01 ERROR before\r\n\
+14.07.2026 10:00:02 neutral\r\n\
+14.07.2026 10:00:03 GraphEmail middle\r\n\
+    continuation\r\n\
+14.07.2026 10:00:04 neutral\r\n\
+14.07.2026 10:00:05 ERROR after\r\n\
+14.07.2026 10:00:06 GraphEmail last";
+        let mut file = scan_file_of("around.log");
+        file.path = dir.join("around.zst");
+        std::fs::write(&file.path, zstd::stream::encode_all(text.as_bytes(), 3).unwrap()).unwrap();
+        let mut other = scan_file_of("other.log");
+        other.path = dir.join("other.zst");
+        std::fs::write(
+            &other.path,
+            zstd::stream::encode_all(&b"14.07.2026 10:00:07 GraphEmail another file"[..], 3).unwrap(),
+        )
+        .unwrap();
+        let files = [file, other];
+        let wanted = [(0, 8, 2), (1, 1, 3), (0, 4, 1), (0, 1, 0)];
+        let matcher = Matcher::new("error", false, false).unwrap();
+        for memory in [false, true] {
+            let cache = MemCache::new(memory, 64);
+            for (before, after, expected) in [
+                (0, 0, vec![]),
+                (1, 0, vec![2]),
+                (2, 0, vec![1, 2]),
+                (0, 1, vec![0]),
+                (0, 2, vec![0, 1]),
+                (2, 2, vec![0, 1, 2]),
+                (1000, 1000, vec![0, 1, 2]),
+            ] {
+                let mut matched = Vec::new();
+                let mut delivered = 0;
+                fetch_hit_lines_cancellable(
+                    &files,
+                    &wanted,
+                    ContextWindow { before, after },
+                    &cache,
+                    &AtomicBool::new(false),
+                    |slot, entry| {
+                        delivered += 1;
+                        assert!(entry.context_before.len() <= before);
+                        assert!(entry.context_after.len() <= after);
+                        if slot == 1 {
+                            assert!(entry.line.ends_with("\ncontinuation"));
+                        }
+                        if matcher.matches_fetched(&entry) {
+                            matched.push(slot);
+                        }
+                    },
+                )
+                .unwrap();
+                matched.sort_unstable();
+                assert_eq!(delivered, 4);
+                assert_eq!(matched, expected, "before={before}, after={after}, memory={memory}");
+            }
+            let cancel = AtomicBool::new(false);
+            let result = fetch_hit_lines_cancellable(
+                &files,
+                &[(0, 8, 0)],
+                ContextWindow::default(),
+                &cache,
+                &cancel,
+                |_, _| {
+                    cancel.store(true, Ordering::Relaxed);
+                },
+            );
+            assert_eq!(result.unwrap_err(), CANCELLED);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_around_matches_entry_and_context_with_regex_case_and_exclusions() {
+        let entry = FetchedLine {
+            line: "GraphEmail\n    continuation".into(),
+            context_before: vec!["ERROR before".into()],
+            context_after: vec!["noise after".into()],
+        };
+        for (query, regex, sensitive, expected) in [
+            ("error", false, false, true),
+            ("error", false, true, false),
+            ("^ERROR before$", true, true, true),
+            ("^noise after$", true, true, true),
+            ("continuation", false, true, true),
+            ("absent", false, false, false),
+            (r"^(?!.*noise).*ERROR", true, false, false),
+        ] {
+            let matcher = Matcher::new(query, regex, sensitive).unwrap();
+            assert_eq!(matcher.matches_fetched(&entry), expected, "{query}");
+        }
     }
 
     /// However many lines of a multi-line entry match, the entry is one hit,

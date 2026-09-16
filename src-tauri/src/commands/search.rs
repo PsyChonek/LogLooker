@@ -219,8 +219,8 @@ pub async fn search_logs(
 }
 
 /// One narrowing step: a second query run over the result already on screen
-/// instead of over the cached files. Only the entries the current hits point at
-/// are re-read, so refining a finished search costs a fraction of repeating it.
+/// instead of over the cached files. Re-reads the current hits' entries and
+/// optional surrounding lines, without collecting new hits.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NarrowRequest {
@@ -230,10 +230,51 @@ pub struct NarrowRequest {
     /// Keep the hits that do *not* match instead of the ones that do
     #[serde(default)]
     pub invert: bool,
+    #[serde(default)]
+    pub lines_before: usize,
+    #[serde(default)]
+    pub lines_after: usize,
 }
 
-/// Filters the stored result down to the hits whose entry matches (or, inverted,
-/// does not match) a second query, and remembers what it dropped so the step can
+impl NarrowRequest {
+    fn context(&self) -> Result<search::ContextWindow, String> {
+        if self.lines_before > 1000 || self.lines_after > 1000 {
+            return Err("Search around supports up to 1000 lines before and after".into());
+        }
+        Ok(search::ContextWindow {
+            before: self.lines_before,
+            after: self.lines_after,
+        })
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::NarrowRequest;
+
+    #[test]
+    fn narrow_window_defaults_to_entry_only_and_validates_limits() {
+        let mut value = serde_json::json!({
+            "query": "error", "isRegex": false, "caseSensitive": false,
+        });
+        let request: NarrowRequest = serde_json::from_value(value.clone()).unwrap();
+        let context = request.context().unwrap();
+        assert_eq!((context.before, context.after), (0, 0));
+        for (before, after, valid) in [(5, 0, true), (0, 1000, true), (1001, 0, false), (0, 1001, false)] {
+            value["linesBefore"] = before.into();
+            value["linesAfter"] = after.into();
+            let request: NarrowRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(request.context().is_ok(), valid);
+        }
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            value["linesBefore"] = invalid;
+            assert!(serde_json::from_value::<NarrowRequest>(value.clone()).is_err());
+        }
+    }
+}
+
+/// Filters the stored result down to hits whose entry and surrounding window
+/// match (or, inverted, do not match), and remembers what it dropped so the step can
 /// be undone. The hits keep their current order, their columns and their group
 /// masks - this only removes rows, so pages, sorting, charts and exports all
 /// carry on against the narrowed result without knowing about it.
@@ -249,6 +290,7 @@ pub async fn narrow_search(
     if request.query.is_empty() {
         return Err("Type something to narrow the results with".into());
     }
+    let context = request.context()?;
     let matcher = Matcher::new(&request.query, request.is_regex, request.case_sensitive)?;
     let cancel = Arc::clone(&cancel.0);
     cancel.store(false, Ordering::Relaxed);
@@ -272,8 +314,8 @@ pub async fn narrow_search(
     let mut done = 0usize;
     let mut kept = 0usize;
     let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
-    search::fetch_hit_lines_cancellable(&guard.files, &wanted, 0, &cache, &cancel, |slot, entry| {
-        let matched = matcher.matches_entry(&entry.line) != request.invert;
+    search::fetch_hit_lines_cancellable(&guard.files, &wanted, context, &cache, &cancel, |slot, entry| {
+        let matched = matcher.matches_fetched(&entry) != request.invert;
         keep[slot] = matched;
         done += 1;
         kept += usize::from(matched);
@@ -306,6 +348,8 @@ pub async fn narrow_search(
             .map(|(_, hit)| *hit),
     );
     guard.hits = narrowed;
+    // Expanded rows show enough surrounding text to inspect nearby matches.
+    guard.context_lines = guard.context_lines.max(context.before).max(context.after);
     guard.narrowed_from.push(previous);
     guard.meta.total_hits = guard.hits.len();
     // Narrowing can empty a column outright, and the columns keep the values of
