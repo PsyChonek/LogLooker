@@ -87,27 +87,52 @@ const timeEnabled = ref(savedFilter.timeEnabled ?? false);
 const timeFrom = ref(savedFilter.timeFrom ?? '');
 const timeTo = ref(savedFilter.timeTo ?? '');
 
+function dayRangeWindow(): { from: string; to: string } {
+  return { from: `${store.dateFrom}T00:00`, to: `${store.dateTo}T23:59` };
+}
+
 // First enable seeds the window with the whole selected day range, so the
 // inputs never open on an empty value the backend could not parse.
 watch(timeEnabled, (on) => {
   if (!on) return;
-  if (!timeFrom.value) timeFrom.value = `${store.dateFrom}T00:00`;
-  if (!timeTo.value) timeTo.value = `${store.dateTo}T23:59`;
+  const range = dayRangeWindow();
+  if (!timeFrom.value) timeFrom.value = range.from;
+  if (!timeTo.value) timeTo.value = range.to;
 });
 
+// The window is persisted, but the day range is picked anew each session. A
+// saved window that misses the selected days entirely would clamp into an
+// empty range, so it is re-seeded with the day range instead.
+watch(
+  () => [store.dateFrom, store.dateTo],
+  () => {
+    if (!timeFrom.value || !timeTo.value || timeFrom.value > timeTo.value) return;
+    const range = dayRangeWindow();
+    if (timeTo.value >= range.from && timeFrom.value <= range.to) return;
+    timeFrom.value = range.from;
+    timeTo.value = range.to;
+  },
+  { immediate: true },
+);
+
 function wallTimeWindow(): { from: string; to: string } {
-  const rangeFrom = `${store.dateFrom}T00:00`;
-  const rangeTo = `${store.dateTo}T23:59`;
+  const range = dayRangeWindow();
   return {
-    from: timeFrom.value && timeFrom.value > rangeFrom ? timeFrom.value : rangeFrom,
-    to: timeTo.value && timeTo.value < rangeTo ? timeTo.value : rangeTo,
+    from: timeFrom.value && timeFrom.value > range.from ? timeFrom.value : range.from,
+    to: timeTo.value && timeTo.value < range.to ? timeTo.value : range.to,
   };
 }
 
-const timeWindowInvalid = computed(() => {
-  if (!timeEnabled.value) return false;
+// Clamping to the day range can invert a window the user entered in order, so
+// an inverted window says which of the two it is.
+const timeWindowError = computed(() => {
+  if (!timeEnabled.value) return null;
+  if (timeFrom.value && timeTo.value && timeFrom.value > timeTo.value) {
+    return '"from" is after "to"';
+  }
   const window = wallTimeWindow();
-  return window.from > window.to;
+  if (window.from > window.to) return 'outside the selected date range';
+  return null;
 });
 
 // The backend receives UTC boundaries (NaiveDateTime needs seconds). The "to"
@@ -299,8 +324,8 @@ async function removeSavedQuery(saved: SavedQuery) {
 
 async function search(preview = false) {
   if (store.selectedServices.length === 0 || searching.value) return;
-  if (timeWindowInvalid.value) {
-    error.value = 'Time filter: "from" is after "to".';
+  if (timeWindowError.value) {
+    error.value = `Time filter: ${timeWindowError.value}.`;
     return;
   }
   const window = timeWindow();
@@ -1147,8 +1172,8 @@ onUnmounted(() => {
             :utc="timeMode === 'utc'"
           />
         </div>
-        <span v-if="timeWindowInvalid" class="text-red-600 dark:text-red-400">
-          "from" is after "to"
+        <span v-if="timeWindowError" class="text-red-600 dark:text-red-400">
+          {{ timeWindowError }}
         </span>
       </template>
     </div>
