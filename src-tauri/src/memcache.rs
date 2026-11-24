@@ -439,8 +439,17 @@ mod tests {
         cache.begin_pass();
         cache.load(&path, text_bytes()).unwrap().unwrap();
 
-        // A live file grew: same path, new bytes
+        // A live file grew: same path, new bytes. Both versions can compress to
+        // the same length and the two writes can share an mtime tick, so stamp the
+        // rewrite a second later the way a real later sync would be.
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         write_zst(&dir, "a.log.zst", LINES / 2);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(first_mtime + std::time::Duration::from_secs(1))
+            .unwrap();
         cache.begin_pass();
         assert!(
             cache.get(&path).unwrap().is_none(),
