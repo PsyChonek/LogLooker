@@ -4,7 +4,7 @@
 # are read out of the built MSIs rather than typed.
 
 PackageIdentifier: PsyChonek.LogLooker
-PackageVersion: 1.2.0
+PackageVersion: 1.2.1
 Platform:
   - Windows.Desktop
 MinimumOSVersion: 10.0.0.0
@@ -15,12 +15,12 @@ InstallerType: wix
 Scope: machine
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/PsyChonek/LogLooker/releases/download/v1.2.0/LogLooker_1.2.0_x64_en-US.msi
-    InstallerSha256: 292D1C7F712232D905BC5A975823CD0CB783D1DEC65D061612AF0D84FBC27AFB
-    ProductCode: '{66C10685-4876-4B8C-9AFD-7896EA24B9D4}'
+    InstallerUrl: https://github.com/PsyChonek/LogLooker/releases/download/v1.2.1/LogLooker_1.2.1_x64_en-US.msi
+    InstallerSha256: AE662B759058FB9903452008BD5C28308D7A312F51A2A21D4F1C027D90AA91EB
+    ProductCode: '{628F36F1-1ABC-49E8-BEA5-035F2CEC0622}'
   - Architecture: arm64
-    InstallerUrl: https://github.com/PsyChonek/LogLooker/releases/download/v1.2.0/LogLooker_1.2.0_arm64_en-US.msi
-    InstallerSha256: F6FF300556D93C964BBD9A30D12882D75B3BD666AC8356E6AEC3A8B7949677BB
-    ProductCode: '{2B408A23-8523-4580-A167-FEF39E8B237D}'
+    InstallerUrl: https://github.com/PsyChonek/LogLooker/releases/download/v1.2.1/LogLooker_1.2.1_arm64_en-US.msi
+    InstallerSha256: 75ABB7756D8F029A1D3A67DC328012EAEC4AA18894A4A20C142356D296528F32
+    ProductCode: '{9EECB848-B520-4177-B350-6866F58A0C8D}'
 ManifestType: installer
 ManifestVersion: 1.12.0
